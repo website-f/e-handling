@@ -1,0 +1,87 @@
+name: e-handling
+
+# Ports 8800-8809 are reserved for this project on the dev box.
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ehandling
+      POSTGRES_USER: ehandling
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    command: >
+      postgres
+      -c max_connections=300
+      -c shared_buffers=256MB
+      -c effective_cache_size=768MB
+      -c synchronous_commit=on
+      -c wal_compression=on
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${DB_PORT:-8805}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ehandling -d ehandling"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgres://ehandling:${POSTGRES_PASSWORD}@db:5432/ehandling?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+      IP_HASH_SALT: ${IP_HASH_SALT:-change-me}
+      DEMO_FALLBACK: ${DEMO_FALLBACK:-true}
+      DB_MAX_CONNS: ${DB_MAX_CONNS:-40}
+      ELECTIONDATA_API_KEY: ${ELECTIONDATA_API_KEY:-}
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      replicas: ${API_REPLICAS:-2}
+    restart: unless-stopped
+
+  # Candidate portraits: Wikipedia first, then a Camoufox (stealth Firefox) image search.
+  # Face-cropped WebP files land in the `photos` volume; only admin-approved ones are shown.
+  photos:
+    build: ./photos
+    environment:
+      DATABASE_URL: postgresql://ehandling:${POSTGRES_PASSWORD}@db:5432/ehandling
+      PHOTO_DIR: /data/photos
+      PHOTO_AUTO_APPROVE: ${PHOTO_AUTO_APPROVE:-consensus}
+      PHOTO_PACE_SECONDS: ${PHOTO_PACE_SECONDS:-6}
+    volumes:
+      - photos:/data/photos
+    shm_size: 1gb
+    mem_limit: 1500m
+    depends_on:
+      api: { condition: service_healthy }  # the API owns the schema
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "${GATEWAY_PORT:-8800}:80"
+    volumes:
+      - photos:/usr/share/nginx/photos:ro
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  photos:

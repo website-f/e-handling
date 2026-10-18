@@ -1,0 +1,158 @@
+@import "tailwindcss";
+@import "@fontsource-variable/atkinson-hyperlegible-next";
+@import "@fontsource-variable/atkinson-hyperlegible-mono";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+  Tokens (shadcn-style). One accent: deep teal.
+  Shape rule: inputs + buttons = rounded-xl (12px), cards = rounded-2xl (16px), chips/pills = rounded-full.
+  Body text targets AAA contrast; the primary audience is older readers.
+  Theme: follows the system unless the header toggle sets .light or .dark on <html>.
+*/
+:root {
+  --background: #f2f4f5;
+  --foreground: #0f191e;
+  --card: #fdfefe;
+  --card-foreground: #0f191e;
+  --inset: #f5f7f8;
+  --muted: #e6ebed;
+  --muted-foreground: #3e4c54;
+  --border: #d6dde1;
+  --input: #6b7a82;
+  --primary: #0b6b5d;
+  --primary-hover: #095a4e;
+  --primary-foreground: #f4fbf9;
+  --primary-soft: #e0f0ec;
+  --primary-line: #a9d6cb;
+  --ring: #0b6b5d;
+  --destructive: #a8261b;
+  --destructive-soft: #fbe9e7;
+  --warning-soft: #fdf3dc;
+  --warning-foreground: #6b4a05;
+  --shadow: 200 30% 20%;
+}
+
+:root.dark {
+  --background: #0c1214;
+  --foreground: #e9eef0;
+  --card: #131b1e;
+  --card-foreground: #e9eef0;
+  --inset: #172024;
+  --muted: #1c262a;
+  --muted-foreground: #aebbc1;
+  --border: #263236;
+  --input: #75868e;
+  --primary: #4cc7ad;
+  --primary-hover: #6dd4be;
+  --primary-foreground: #04201a;
+  --primary-soft: #11302a;
+  --primary-line: #1f5a4d;
+  --ring: #4cc7ad;
+  --destructive: #f28b80;
+  --destructive-soft: #3a1714;
+  --warning-soft: #33280e;
+  --warning-foreground: #f3d488;
+  --shadow: 200 40% 2%;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --background: #0c1214;
+    --foreground: #e9eef0;
+    --card: #131b1e;
+    --card-foreground: #e9eef0;
+    --inset: #172024;
+    --muted: #1c262a;
+    --muted-foreground: #aebbc1;
+    --border: #263236;
+    --input: #75868e;
+    --primary: #4cc7ad;
+    --primary-hover: #6dd4be;
+    --primary-foreground: #04201a;
+    --primary-soft: #11302a;
+    --primary-line: #1f5a4d;
+    --ring: #4cc7ad;
+    --destructive: #f28b80;
+    --destructive-soft: #3a1714;
+    --warning-soft: #33280e;
+    --warning-foreground: #f3d488;
+    --shadow: 200 40% 2%;
+  }
+}
+
+@theme inline {
+  --font-sans: "Atkinson Hyperlegible Next Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Atkinson Hyperlegible Mono Variable", ui-monospace, monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-inset: var(--inset);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-soft: var(--primary-soft);
+  --color-primary-line: var(--primary-line);
+  --color-ring: var(--ring);
+  --color-destructive: var(--destructive);
+  --color-destructive-soft: var(--destructive-soft);
+  --color-warning-soft: var(--warning-soft);
+  --color-warning-foreground: var(--warning-foreground);
+}
+
+@layer base {
+  /* Root size drives every rem; the "Saiz teks" control rewrites it (100% / 112.5% / 125%). */
+  html {
+    font-size: 112.5%;
+    -webkit-text-size-adjust: 100%;
+    color-scheme: light dark;
+    scroll-padding-top: 5rem;
+  }
+  html.light { color-scheme: light; }
+  html.dark { color-scheme: dark; }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    line-height: 1.55;
+    font-feature-settings: "ss01";
+  }
+  * {
+    @apply border-border;
+  }
+  :focus-visible {
+    outline: 3px solid var(--ring);
+    outline-offset: 3px;
+  }
+  ::selection {
+    background: var(--primary-soft);
+  }
+}
+
+@utility shadow-soft {
+  box-shadow:
+    0 1px 2px hsl(var(--shadow) / 0.05),
+    0 10px 30px -14px hsl(var(--shadow) / 0.2);
+}
+
+@utility shadow-lift {
+  box-shadow:
+    0 1px 2px hsl(var(--shadow) / 0.06),
+    0 18px 40px -18px hsl(var(--shadow) / 0.32);
+}
+
+@utility pb-safe {
+  padding-bottom: max(0.875rem, env(safe-area-inset-bottom));
+}
+
+@keyframes eh-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes eh-sheet-up {
+  from { transform: translateY(24px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}

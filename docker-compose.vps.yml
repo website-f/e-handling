@@ -1,0 +1,9 @@
+# VPS overlay (84.46.249.133). Orxies terminates TLS for handling.oriondesk.space and proxies
+# to the gateway on loopback. Nothing else is published.
+#   docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --build
+services:
+  db:
+    ports: !override []
+  gateway:
+    ports: !override
+      - "127.0.0.1:${GATEWAY_PORT:-8800}:80"
