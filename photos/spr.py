@@ -77,9 +77,59 @@ _LABEL_OF = {alias: key for key, aliases in LABELS.items() for alias in aliases}
 REQUIRED = ("name", "parliament", "state")
 
 
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().rstrip(":").strip()).lower()
+
+
 def _label(text: str) -> str | None:
-    t = re.sub(r"\s+", " ", text.strip().rstrip(":").strip()).lower()
-    return _LABEL_OF.get(t)
+    t = _norm(text)
+    if t in _LABEL_OF:
+        return _LABEL_OF[t]
+    # The portal's name row is not labelled plain "Nama" (seen live 2026-10-20): accept "Nama ..."
+    # variants such as "Nama Penuh" / "Nama Pemilih", but only short label-like text, not a value.
+    # Someone else's name (a parent, spouse) or a place's name must never become the voter's.
+    if len(t) <= 30 and re.fullmatch(r"nama(?: [a-z()/.]+){1,3}", t) and not re.search(
+            r"\b(?:bapa|ayah|ibu|emak|suami|isteri|waris|penjaga|pusat|sekolah|tempat|tadika|dewan|jalan|kampung)\b", t):
+        return "name"
+    return None
+
+
+def unknown_labels(lines: list[str]) -> list[str]:
+    """Left-hand cells of label/value rows we do not recognise. Labels only (the value side is
+    never included), and only short digit-free text, so no voter data reaches the logs."""
+    out: list[str] = []
+    for line in lines:
+        cells = [c.strip() for c in line.split("\t") if c.strip() and c.strip() != ":"]
+        if len(cells) >= 2:
+            left = cells[0]
+        elif ":" in line and line.split(":", 1)[1].strip():
+            left = line.split(":", 1)[0]
+        else:
+            continue
+        t = _norm(left)
+        if t and not _label(t) and len(t) <= 40 and not re.search(r"\d", t) and t not in out:
+            out.append(t)
+    return out[:20]
+
+
+def line_shapes(lines: list[str]) -> list[str]:
+    """One token per non-empty line describing its shape, never its content: K:<field> for a
+    recognised label (alone or with its value), else <tabs>t<colons>c[d if digits]<length>."""
+    shapes = []
+    for line in lines:
+        ln = line.strip()
+        if not ln:
+            continue
+        cells = [c.strip() for c in ln.split("\t") if c.strip() and c.strip() != ":"]
+        key = _label(cells[0]) if cells else None
+        if not key and ":" in ln:
+            key = _label(ln.split(":", 1)[0])
+        if key:
+            shapes.append(f"K:{key}")
+        else:
+            digits = "d" if re.search(r"\d", ln) else ""
+            shapes.append(f"{ln.count(chr(9))}t{ln.count(':')}c{digits}{len(ln)}")
+    return shapes[:60]
 
 
 def extract_fields(lines: list[str]) -> dict[str, str]:
@@ -218,9 +268,12 @@ def sanitize_message(msg: str) -> str:
 
 def diagnostics(snap: dict[str, Any], fields: dict[str, str]) -> dict[str, Any]:
     """Structure only (which labels, how many lines, which path), never values."""
+    lines = snap.get("text", "").split("\n")
     return {
         "labels_found": sorted(fields),
-        "line_count": len([ln for ln in snap.get("text", "").split("\n") if ln.strip()]),
+        "unknown_labels": unknown_labels(lines),
+        "line_shapes": line_shapes(lines),
+        "line_count": len([ln for ln in lines if ln.strip()]),
         "title": snap.get("title", "")[:120],
         "path": urlsplit(snap.get("url", "")).path,
         "has_form": bool(snap.get("has_form")),

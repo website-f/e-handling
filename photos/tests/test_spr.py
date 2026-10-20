@@ -42,6 +42,30 @@ def test_extract_fields_handles_three_row_shapes():
         assert f["name"] == "A B" and f["parliament"] == "P.001 - X"
 
 
+@pytest.mark.parametrize("label", ["Nama Penuh", "NAMA PEMILIH", "Nama Penuh Pemilih", "Nama (Seperti Dalam MyKad)"])
+def test_name_label_variants(label):
+    for lines in ([f"{label}\t:\tA B"], [f"{label} : A B"], [label, ":", "A B"]):
+        assert extract_fields(lines)["name"] == "A B"
+
+
+def test_long_or_numeric_nama_text_is_not_a_label():
+    assert "name" not in extract_fields(["Nama pusat mengundi yang sangat panjang sekali\tX"])
+    assert "name" not in extract_fields(["Nama 2\tX"])
+    assert "name" not in extract_fields(["Nama Bapa\t:\tX", "Nama Pusat Mengundi\t:\tY"])
+
+
+def test_diagnostics_show_unknown_labels_but_never_values():
+    text = "\n".join([f"No. Kad Pengenalan\t:\t{IC}", "Nama Bapa\t:\tPEMILIH RAHSIA", "Catatan : nota 123",
+                      "Parlimen\t:\tP.173 - PUTATAN", "BARIS TANPA LABEL"])
+    out = classify(snap(text), IC)
+    d = out["diagnostics"]
+    assert d["unknown_labels"] == ["nama bapa", "catatan"]
+    assert d["line_shapes"][0] == "K:ic" and d["line_shapes"][3] == "K:parliament"
+    blob = repr(d)
+    for secret in ("PEMILIH RAHSIA", "nota", IC, "PUTATAN", "BARIS"):
+        assert secret not in blob
+
+
 def test_label_without_value_is_not_filled_from_next_label():
     f = extract_fields(["Nama", "Parlimen", "P.001 - X"])
     assert "name" not in f
