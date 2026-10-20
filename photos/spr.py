@@ -40,7 +40,30 @@ log = logging.getLogger("spr")
 
 SPR_URL = os.environ.get("SPR_URL", "https://mysprsemak.spr.gov.my/semakan/daftarPemilih")
 SESSION_TTL = float(os.environ.get("SPR_SESSION_TTL_S", "240"))
-SLOT_WAIT = float(os.environ.get("SPR_SLOT_WAIT_S", "15"))
+SLOT_WAIT = float(os.environ.get("SPR_SLOT_WAIT_S", "30"))
+# Each voter gets a fresh context (empty cache), so skip what the lookup never needs: fonts, media,
+# decorative images and third-party hosts. Kept: the portal's own pages, scripts and styles (styles
+# decide what innerText shows), its CAPTCHA image, and jsDelivr (SweetAlert messages).
+BLOCK_ASSETS = os.environ.get("SPR_BLOCK_ASSETS", "true").strip().lower() in ("1", "true", "yes")
+_ALLOWED_HOSTS = {urlsplit(SPR_URL).hostname, "cdn.jsdelivr.net"}
+
+
+def keep_request(url: str, resource_type: str) -> bool:
+    if (urlsplit(url).hostname or "") not in _ALLOWED_HOSTS:
+        return False
+    if resource_type in ("font", "media"):
+        return False
+    if resource_type == "image":
+        return "/captcha/" in url
+    return True
+
+
+async def _route_filter(route) -> None:
+    req = route.request
+    if keep_request(req.url, req.resource_type):
+        await route.continue_()
+    else:
+        await route.abort()
 MAX_CAPTCHA_ATTEMPTS = int(os.environ.get("SPR_MAX_CAPTCHA_ATTEMPTS", "3"))
 MAX_REFRESHES = int(os.environ.get("SPR_MAX_REFRESHES", "5"))
 INTERNAL_TOKEN = os.environ.get("SPR_INTERNAL_TOKEN", "")
@@ -92,6 +115,33 @@ def _label(text: str) -> str | None:
             r"\b(?:bapa|ayah|ibu|emak|suami|isteri|waris|penjaga|pusat|sekolah|tempat|tadika|dewan|jalan|kampung)\b", t):
         return "name"
     return None
+
+
+def all_fields(lines: list[str]) -> list[dict[str, str]]:
+    """Every label/value row on the result page, verbatim and in page order, recognised or not,
+    so the stored record keeps whatever the portal showed (status, centre, notes...). Only goes
+    to the API with a found result; never logged."""
+    out: list[dict[str, str]] = []
+    clean = [ln.strip() for ln in lines]
+    for i, line in enumerate(clean):
+        if not line:
+            continue
+        cells = [c.strip() for c in line.split("\t") if c.strip() and c.strip() != ":"]
+        label = value = ""
+        if len(cells) >= 2:
+            label, value = cells[0], " ".join(cells[1:]).lstrip(": ").strip()
+        elif ":" in line and line.split(":", 1)[1].strip():
+            label, value = line.split(":", 1)[0].strip(), line.split(":", 1)[1].strip()
+        elif _label(line):
+            nxt = next((n for n in clean[i + 1:i + 3] if n and n != ":"), "")
+            if nxt and not _label(nxt):
+                label, value = line, nxt.lstrip(": ").strip()
+        label = label.rstrip(":").strip()
+        # Labels are short and self-contained; long text, or text cut at a colon inside brackets
+        # ("Sila masukkan ... (cth: 98xx...)"), is a sentence on the page, not a field.
+        if label and value and len(label) <= 40 and label.count("(") == label.count(")"):
+            out.append({"label": label, "value": value[:300]})
+    return out[:60]
 
 
 def unknown_labels(lines: list[str]) -> list[str]:
@@ -201,12 +251,37 @@ def parse_locality(v: str) -> dict[str, str]:
     return {"code": "/".join(m.groups()), "name": _rest(v, m)}
 
 
+_MASK = "*xX•●#"
+
+
+def ic_matches(value: str, ic: str) -> bool:
+    """Does the IC shown on the result page belong to the IC that was submitted?
+
+    The portal's value is not always the bare 12 digits: it can be dashed, carry an old IC or
+    service number alongside ("990123125571 (A1234567)"), or be partly masked ("990123-12-****").
+    Accept the submitted IC as a whole 12-digit group, or a masked group whose visible digits all
+    agree with it (at least 6 of them). A different IC never matches."""
+    for m in re.finditer(rf"(?<![\d{_MASK}])[\d{_MASK}]{{6}}-?[\d{_MASK}]{{2}}-?[\d{_MASK}]{{4}}(?![\d{_MASK}])", value):
+        group = m.group(0).replace("-", "")
+        visible = [(c, d) for c, d in zip(group, ic) if c.isdigit()]
+        if len(visible) == 12 and group == ic:
+            return True
+        if 6 <= len(visible) < 12 and all(c == d for c, d in visible):
+            return True
+    return False
+
+
+def value_shape(value: str) -> str:
+    """'990123-12-5571 (A123)' -> 'dddddd-dd-dddd (Addd)': format without content, for diagnostics."""
+    return "".join("d" if c.isdigit() else "A" if c.isalpha() else c for c in value)[:60]
+
+
 def build_voter(fields: dict[str, str], ic: str) -> tuple[dict[str, Any] | None, str]:
     """Normalized voter record, or (None, reason). Missing fields stay empty, never inferred."""
     missing = [k for k in REQUIRED if not fields.get(k)]
     if missing:
         return None, "missing:" + ",".join(missing)
-    if fields.get("ic") and re.sub(r"\D", "", fields["ic"]) != ic:
+    if fields.get("ic") and not ic_matches(fields["ic"], ic):
         return None, "ic_mismatch"  # a stale or someone else's page must never be returned
     par = parse_parliament(fields["parliament"])
     if par is None:
@@ -244,8 +319,11 @@ def classify(snap: dict[str, Any], ic: str) -> dict[str, Any]:
     if fields.get("name") or fields.get("parliament"):
         voter, reason = build_voter(fields, ic)
         if voter:
-            return {"status": "found", "voter": voter, "fields": sorted(fields)}
-        return {"status": "unexpected_layout", "reason": reason, "diagnostics": diagnostics(snap, fields)}
+            return {"status": "found", "voter": voter, "fields": sorted(fields), "raw_fields": all_fields(lines)}
+        diag = diagnostics(snap, fields)
+        if reason == "ic_mismatch":
+            diag["ic_value_shape"] = value_shape(fields["ic"])
+        return {"status": "unexpected_layout", "reason": reason, "diagnostics": diag}
 
     message = " ".join(m for m in snap.get("messages", []) if m).strip()
     if message and _CAPTCHA_MSG.search(message):
@@ -355,12 +433,18 @@ class CamoufoxPortal:
         return (await img.get_attribute("src", timeout=self.s.browser.action_timeout_ms)) or ""
 
     async def refresh_captcha(self, old_src: str) -> None:
-        link = self.page.locator(SEL_REFRESH).first
-        await wait_actionable(link, self.s.browser.action_timeout_ms)
-        await link.click()
-        await self.page.wait_for_function(
-            "old => { const i = document.querySelector('#img_captcha img'); return i && i.getAttribute('src') !== old; }",
-            arg=old_src, timeout=self.s.browser.action_timeout_ms)
+        # The portal's refresh link calls jQuery, which it loads over plain http and browsers block
+        # on this https page. Try the link briefly; otherwise reload the form (an idempotent GET).
+        # The IC is typed again just before submitting, so a reloaded, empty form is fine.
+        try:
+            link = self.page.locator(SEL_REFRESH).first
+            await wait_actionable(link, 2000)
+            await link.click()
+            await self.page.wait_for_function(
+                "old => { const i = document.querySelector('#img_captcha img'); return i && i.getAttribute('src') !== old; }",
+                arg=old_src, timeout=3000)
+        except Exception:  # noqa: BLE001
+            await self.open()
 
     async def fill_answer(self, answer: str) -> None:
         box = self.page.locator(SEL_CAPTCHA_INPUT)
@@ -436,6 +520,8 @@ class SprService:
         self._release = release  # async (ctx) -> None
         self._clock = clock
         self._starting: dict[str, asyncio.Future] = {}
+        self.capacity = s.browser.max_concurrent_pages
+        self.waiting = 0  # lookups queued for a free browser slot
 
     # -- lifecycle
 
@@ -463,11 +549,14 @@ class SprService:
             self._starting.pop(job_id, None)
 
     async def _start(self, job_id: str, ic: str) -> dict[str, Any]:
+        self.waiting += 1
         try:
             await asyncio.wait_for(self.slots.acquire(), timeout=SLOT_WAIT)
         except asyncio.TimeoutError:
             self.stats.failures["start:busy"] += 1
             return {"status": "busy"}
+        finally:
+            self.waiting -= 1
         t0 = self._clock()
         portal = ctx = None
         try:
@@ -701,7 +790,9 @@ def make_app(service: SprService):
 
     async def stats(_):
         open_sessions = sum(1 for s in service.sessions.values() if s.finished is None)
-        return web.json_response({"open_sessions": open_sessions, **service.stats.snapshot()})
+        return web.json_response({"open_sessions": open_sessions, "capacity": service.capacity,
+                                  "in_use": service.capacity - service.slots._value, "waiting": service.waiting,
+                                  **service.stats.snapshot()})
 
     app = web.Application(middlewares=[auth], client_max_size=4096)
     app.router.add_post("/sessions", start)
@@ -721,11 +812,14 @@ async def main() -> None:
     if not INTERNAL_TOKEN:
         # Demo deployments run this container too; without a token every request is refused.
         log.warning("SPR_INTERNAL_TOKEN not set: lookups disabled")
-    s = settings_mod.load("SPR_MAX_CONCURRENT_PAGES", 3)
-    browser = CamoufoxBrowser(s, idle_close=300, locale="ms-MY")
+    s = settings_mod.load("SPR_MAX_CONCURRENT_PAGES", 12)
+    # Launching Firefox costs ~6-10 s, so keep it warm: launch at start-up, close only after a long idle.
+    browser = CamoufoxBrowser(s, idle_close=float(os.environ.get("SPR_BROWSER_IDLE_CLOSE_S", "1800")), locale="ms-MY")
 
     async def open_portal():
         ctx = await browser.new_context()
+        if BLOCK_ASSETS:
+            await ctx.route("**/*", _route_filter)
         page = await ctx.new_page()
         return CamoufoxPortal(ctx, page, s), ctx
 
@@ -733,8 +827,12 @@ async def main() -> None:
     runner = web.AppRunner(make_app(service), access_log=None)  # paths carry no IC, but keep logs quiet
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("SPR_PORT", "8090"))).start()
-    log.info("spr lookup service ready (pages=%d, ttl=%ss, headless=%s)", s.browser.max_concurrent_pages, SESSION_TTL,
-             s.browser.headless)
+    try:
+        await browser.warm()
+    except Exception as e:  # noqa: BLE001 - the first lookup will launch it instead
+        log.warning("browser warm-up failed: %s", e)
+    log.info("spr lookup service ready (pages=%d, ttl=%ss, headless=%s, block_assets=%s)", s.browser.max_concurrent_pages,
+             SESSION_TTL, s.browser.headless, BLOCK_ASSETS)
     while True:
         await asyncio.sleep(10)
         await service.sweep()

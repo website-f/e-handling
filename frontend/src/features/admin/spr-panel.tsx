@@ -19,6 +19,8 @@ const LOOKUP_LABEL: Record<string, string> = {
   unexpected_layout: "Paparan portal berubah",
   too_many_attempts: "Captcha gagal 3 kali",
   expired: "Tamat masa",
+  cancelled: "Dibatalkan pemilih",
+  reused: "Rekod tersimpan (tanpa portal)",
   failed: "Gagal",
 };
 

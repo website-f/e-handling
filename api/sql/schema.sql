@@ -73,13 +73,15 @@ CREATE TABLE IF NOT EXISTS candidate_photos (
 CREATE INDEX IF NOT EXISTS candidate_photos_queue_idx ON candidate_photos (status, queued_at);
 
 -- Where a voter row came from: 'seed' (demo data), 'demo' (DEMO_FALLBACK) or 'spr' (confirmed
--- on MySPR Semak by the voter themselves). SPR rows without a survey response are purged after
--- SPR_VOTER_RETENTION (spr_retention.go).
+-- on MySPR Semak by the voter themselves). SPR rows are kept and reused for repeat lookups
+-- (SPR_REUSE_MAX_AGE); SPR_VOTER_RETENTION > 0 purges ones without a survey response (spr.go).
 ALTER TABLE voters ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'seed';
 ALTER TABLE voters ADD COLUMN IF NOT EXISTS verified_at timestamptz;
 ALTER TABLE voters ADD COLUMN IF NOT EXISTS polling_centre text NOT NULL DEFAULT '';
 ALTER TABLE voters ADD COLUMN IF NOT EXISTS stream text NOT NULL DEFAULT '';
 ALTER TABLE voters ADD COLUMN IF NOT EXISTS voting_time text NOT NULL DEFAULT '';
+-- Every label/value row the portal showed, verbatim: [{"label": "...", "value": "..."}].
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS spr_fields jsonb;
 UPDATE voters SET source = 'demo' WHERE is_demo AND source = 'seed';
 CREATE INDEX IF NOT EXISTS voters_spr_idx ON voters (verified_at) WHERE source = 'spr';
 

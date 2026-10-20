@@ -54,20 +54,21 @@ type Area struct {
 }
 
 type Voter struct {
-	IC             string `json:"ic"`
-	FullName       string `json:"full_name"`
-	DOB            string `json:"dob"`
-	Gender         string `json:"gender"`
-	State          string `json:"state"`
-	Parlimen       Area   `json:"parlimen"`
-	DUN            Area   `json:"dun"`
-	DaerahMengundi Area   `json:"daerah_mengundi"`
-	Lokaliti       Area   `json:"lokaliti"`
-	IsDemo         bool   `json:"is_demo"`
-	Source         string `json:"source"` // seed | demo | spr
-	PollingCentre  string `json:"polling_centre,omitempty"`
-	Stream         string `json:"stream,omitempty"`
-	VotingTime     string `json:"voting_time,omitempty"`
+	IC             string     `json:"ic"`
+	FullName       string     `json:"full_name"`
+	DOB            string     `json:"dob"`
+	Gender         string     `json:"gender"`
+	State          string     `json:"state"`
+	Parlimen       Area       `json:"parlimen"`
+	DUN            Area       `json:"dun"`
+	DaerahMengundi Area       `json:"daerah_mengundi"`
+	Lokaliti       Area       `json:"lokaliti"`
+	IsDemo         bool       `json:"is_demo"`
+	Source         string     `json:"source"` // seed | demo | spr
+	PollingCentre  string     `json:"polling_centre,omitempty"`
+	Stream         string     `json:"stream,omitempty"`
+	VotingTime     string     `json:"voting_time,omitempty"`
+	VerifiedAt     *time.Time `json:"verified_at,omitempty"` // when MySPR last confirmed this record
 }
 
 type Option struct {
@@ -87,12 +88,12 @@ type PreviousResponse struct {
 }
 
 const voterColumns = `v.ic, v.full_name, v.dob, v.gender, v.is_demo, v.source, v.polling_centre, v.stream,
-	v.voting_time, l.state, l.par_code, l.par_name, l.dun_code, l.dun_name, l.dm_code, l.dm_name,
+	v.voting_time, v.verified_at, l.state, l.par_code, l.par_name, l.dun_code, l.dun_name, l.dm_code, l.dm_name,
 	CASE WHEN l.code LIKE 'spr:%' THEN '' ELSE l.code END, l.name` // 'spr:' keys are internal (spr.go sprLocalityCode)
 
 func voterScanTargets(v *Voter, dob *time.Time) []any {
 	return []any{&v.IC, &v.FullName, dob, &v.Gender, &v.IsDemo, &v.Source, &v.PollingCentre, &v.Stream,
-		&v.VotingTime, &v.State, &v.Parlimen.Code, &v.Parlimen.Name, &v.DUN.Code, &v.DUN.Name,
+		&v.VotingTime, &v.VerifiedAt, &v.State, &v.Parlimen.Code, &v.Parlimen.Name, &v.DUN.Code, &v.DUN.Name,
 		&v.DaerahMengundi.Code, &v.DaerahMengundi.Name, &v.Lokaliti.Code, &v.Lokaliti.Name}
 }
 

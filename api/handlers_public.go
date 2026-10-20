@@ -16,6 +16,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/spr/lookups", a.handleSprStart)
 	mux.HandleFunc("POST /api/v1/spr/lookups/{id}/captcha", a.handleSprAnswer)
 	mux.HandleFunc("POST /api/v1/spr/lookups/{id}/refresh", a.handleSprRefresh)
+	mux.HandleFunc("POST /api/v1/spr/lookups/{id}/cancel", a.handleSprCancel)
 	mux.HandleFunc("POST /api/v1/responses", a.handleSubmit)
 	mux.HandleFunc("GET /api/v1/contests", a.handleContests)
 	mux.HandleFunc("GET /api/v1/candidates/{uid}", a.handleCandidateHistory)
@@ -74,6 +75,7 @@ type lookupResponse struct {
 	Questions        []Question        `json:"questions"`
 	PreviousResponse *PreviousResponse `json:"previous_response"`
 	VoterToken       string            `json:"voter_token,omitempty"` // SPR mode: required to submit the survey
+	Reused           bool              `json:"reused,omitempty"`      // SPR mode: answered from the stored record
 }
 
 // GET /api/v1/config: which IC flow the frontend shows.

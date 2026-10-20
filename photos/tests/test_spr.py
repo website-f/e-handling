@@ -401,3 +401,106 @@ def test_internal_api_requires_token():
 
 def run(coro):
     return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------- IC formats on the result page
+
+
+@pytest.mark.parametrize("value", [
+    IC, "010101-01-0101", f"{IC} (A1234567)", f"A1234567 / {IC}", "010101-01-****", "010101******",
+    f"{IC[:6]}-{IC[6:8]}-XXXX", f"No. KP: {IC}",
+])
+def test_ic_value_formats_that_match(value):
+    assert spr.ic_matches(value, IC)
+
+
+@pytest.mark.parametrize("value", [
+    OTHER_IC, "020202-02-****", "******020202", "01010*******", "0101010101", "", "A1234567",
+    "010101-01-0102",
+])
+def test_ic_values_that_must_not_match(value):
+    assert not spr.ic_matches(value, IC)
+
+
+def test_result_with_old_ic_alongside_is_found():
+    text = RESULT_TEXT.replace(f"No. Kad Pengenalan\t:\t{IC}", f"No. Kad Pengenalan\t:\t{IC} (A1234567)")
+    assert classify(snap(text), IC)["status"] == "found"
+
+
+def test_ic_mismatch_diagnostics_show_shape_only():
+    out = classify(snap(RESULT_TEXT.replace(IC, OTHER_IC)), IC)
+    assert out["reason"] == "ic_mismatch"
+    assert out["diagnostics"]["ic_value_shape"] == "dddddddddddd"
+    assert OTHER_IC not in repr(out)
+
+
+@pytest.mark.parametrize("url,kind,keep", [
+    ("https://mysprsemak.spr.gov.my/semakan/daftarPemilih", "document", True),
+    ("https://mysprsemak.spr.gov.my/captcha/spr?abc", "image", True),
+    ("https://mysprsemak.spr.gov.my/spr/img/logo.png", "image", False),
+    ("https://mysprsemak.spr.gov.my/spr/css/app.css", "stylesheet", True),
+    ("https://cdn.jsdelivr.net/npm/sweetalert2@9.17.2/dist/sweetalert2.all.min.js", "script", True),
+    ("http://ajax.googleapis.com/ajax/libs/jquery/1.9.1/jquery.js", "script", False),
+    ("https://fonts.gstatic.com/x.woff2", "font", False),
+    ("https://www.google-analytics.com/collect", "xhr", False),
+])
+def test_asset_filter(url, kind, keep):
+    assert spr.keep_request(url, kind) is keep
+
+
+# ---------------------------------------------------------------- many voters at once
+
+
+def test_twenty_voters_share_ten_slots(monkeypatch):
+    """20 voters arrive together with 10 browser slots: the first 10 get a CAPTCHA at once, the
+    rest wait in line and get theirs as soon as earlier voters finish. Nobody is turned away."""
+    monkeypatch.setattr(spr, "SLOT_WAIT", 5)
+    s = settings_mod.Settings(
+        browser=settings_mod.BrowserSettings(max_concurrent_pages=10),
+        execution=settings_mod.ExecutionSettings(minimum_action_interval_ms=0, maximum_action_interval_ms=0),
+    )
+    portals = []
+
+    async def open_portal():
+        p = FakePortal([snap(RESULT_TEXT.replace(IC, ic)) for ic in [current_ic.pop(0)]])
+        portals.append(p)
+        return p, "ctx"
+
+    async def release(ctx):
+        pass
+
+    ics = [f"0101010{i:05d}" for i in range(20)]
+    current_ic = list(ics)
+    svc = SprService(s, open_portal, release=release)
+    jobs = [f"11111111-2222-3333-4444-{i:012d}" for i in range(20)]
+
+    async def voter(job, ic):
+        r = await svc.start(job, ic)
+        assert r["status"] == "awaiting_captcha", r
+        await asyncio.sleep(0.02)  # the voter reads the CAPTCHA
+        return await svc.answer(job, "1234")
+
+    async def go():
+        return await asyncio.gather(*(voter(j, ic) for j, ic in zip(jobs, ics)))
+
+    results = run(go())
+    assert [r["status"] for r in results] == ["found"] * 20
+    assert sorted(r["ic"] for r in results) == sorted(ics)  # each voter got their own record
+    assert svc.slots._value == 10 and svc.waiting == 0
+    assert sum(p.submits for p in portals) == 20
+
+
+def test_found_result_keeps_every_row_verbatim():
+    text = RESULT_TEXT + "\nStatus Pemilih\t:\tPEMILIH BIASA\nNota : Sila bawa MyKad\nSila masukkan No. Kad Pengenalan (cth: 98xxxxxxxxxx) tanpa jarak"
+    out = classify(snap(text), IC)
+    assert out["status"] == "found"
+    raw = {f["label"]: f["value"] for f in out["raw_fields"]}
+    assert raw["Nama"] == "PEMILIH UJIAN SATU"
+    assert raw["Status Pemilih"] == "PEMILIH BIASA"  # not a field we parse, still kept
+    assert raw["Nota"] == "Sila bawa MyKad"
+    assert not any(k.startswith("Sila masukkan") for k in raw)  # page instructions are not fields
+
+
+def test_raw_fields_only_travel_with_found_results():
+    out = classify(snap(RESULT_TEXT.replace(IC, OTHER_IC)), IC)
+    assert "raw_fields" not in out

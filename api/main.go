@@ -35,7 +35,8 @@ type Config struct {
 	SPRWorkerURL         string
 	SPRInternalToken     string
 	SPRRequireCandidates bool          // lookups wait for the candidates phase to complete
-	SPRVoterRetention    time.Duration // SPR voter rows without a survey response
+	SPRVoterRetention    time.Duration // SPR voter rows without a survey response; 0 = keep forever
+	SPRReuseMaxAge       time.Duration // reuse a stored SPR record instead of a new portal check; 0 = any age
 	SPRAuditRetention    time.Duration
 }
 
@@ -81,7 +82,8 @@ func loadConfig() Config {
 		SPRWorkerURL:         strings.TrimRight(env("SPR_WORKER_URL", "http://spr:8090"), "/"),
 		SPRInternalToken:     os.Getenv("SPR_INTERNAL_TOKEN"),
 		SPRRequireCandidates: env("SPR_REQUIRE_CANDIDATE_PHASE", "true") == "true",
-		SPRVoterRetention:    envDuration("SPR_VOTER_RETENTION", 24*time.Hour),
+		SPRVoterRetention:    envDuration("SPR_VOTER_RETENTION", 0),
+		SPRReuseMaxAge:       envDuration("SPR_REUSE_MAX_AGE", 0),
 		SPRAuditRetention:    envDuration("SPR_AUDIT_RETENTION", 90*24*time.Hour),
 	}
 }

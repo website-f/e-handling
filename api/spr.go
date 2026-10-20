@@ -44,8 +44,15 @@ type sprVoter struct {
 	VotingTime     string `json:"voting_time"`
 }
 
+// sprField is one label/value row exactly as the portal showed it, kept so nothing captured is lost.
+type sprField struct {
+	Label string `json:"label"`
+	Value string `json:"value"`
+}
+
 type sprResult struct {
 	Status       string         `json:"status"`
+	RawFields    []sprField     `json:"raw_fields"`
 	Reason       string         `json:"reason"`
 	Message      string         `json:"message"`
 	Captcha      string         `json:"captcha"`
@@ -141,7 +148,9 @@ func newJobID() string {
 
 /* ---------- worker client ---------- */
 
-var sprHTTP = &http.Client{Timeout: 55 * time.Second}
+// Every API replica talks to one worker; keep enough idle connections for a burst of voters.
+var sprHTTP = &http.Client{Timeout: 55 * time.Second, Transport: &http.Transport{
+	MaxIdleConns: 64, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}}
 
 func (a *App) sprCall(ctx context.Context, path string, body any) (sprResult, error) {
 	var res sprResult
@@ -289,7 +298,8 @@ func (a *App) handleSprStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		IC string `json:"ic"`
+		IC      string `json:"ic"`
+		Refresh bool   `json:"refresh"` // voter asked to re-check on the portal
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -311,6 +321,24 @@ func (a *App) handleSprStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job := newJobID()
+
+	// Already confirmed on the portal before: answer from the stored record, no portal session.
+	if !req.Refresh {
+		voter, err := a.storedSprVoter(ctx, ic)
+		if err != nil {
+			a.fail(w, "spr stored voter", err)
+			return
+		}
+		if voter != nil {
+			if _, err := a.db.Exec(ctx, `INSERT INTO spr_lookups (id, ic_hash, ic_masked, ip_hash, status, finished_at)
+				VALUES ($1, $2, $3, $4, 'reused', now())`, job, a.icHash(ic), maskIC(ic), a.hashIP(clientIP(r))); err != nil {
+				a.log.Warn("spr audit reuse", "err", err)
+			}
+			a.writeVoterResult(w, r, *voter, true)
+			return
+		}
+	}
+
 	if _, err := a.db.Exec(ctx, `INSERT INTO spr_lookups (id, ic_hash, ic_masked, ip_hash, status) VALUES ($1, $2, $3, $4, 'processing')`,
 		job, a.icHash(ic), maskIC(ic), a.hashIP(clientIP(r))); err != nil {
 		a.fail(w, "spr audit insert", err)
@@ -356,6 +384,33 @@ func (a *App) handleSprAnswer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.sprRespond(w, r, job, res, true)
+}
+
+// POST /api/v1/spr/lookups/{id}/cancel: the voter left the CAPTCHA screen (Back, start over,
+// closed the tab via sendBeacon). Frees the browser slot now instead of after the session TTL.
+func (a *App) handleSprCancel(w http.ResponseWriter, r *http.Request) {
+	if !a.sprEnabled(w) {
+		return
+	}
+	job := r.PathValue("id")
+	if !jobIDRe.MatchString(job) {
+		writeError(w, http.StatusBadRequest, "bad_request", "Permintaan tidak sah.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, a.cfg.SPRWorkerURL+"/sessions/"+job, nil)
+	req.Header.Set("X-Internal-Token", a.cfg.SPRInternalToken)
+	if resp, err := sprHTTP.Do(req); err == nil {
+		resp.Body.Close()
+	} else {
+		a.log.Warn("spr cancel", "job", job, "err", err)
+	}
+	if _, err := a.db.Exec(ctx, `UPDATE spr_lookups SET status = 'cancelled', finished_at = now(), updated_at = now()
+		WHERE id = $1 AND finished_at IS NULL`, job); err != nil {
+		a.log.Warn("spr audit cancel", "job", job, "err", err)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }
 
 // POST /api/v1/spr/lookups/{id}/refresh
@@ -428,7 +483,7 @@ func (a *App) sprFound(w http.ResponseWriter, r *http.Request, job string, res s
 		writeError(w, http.StatusUnprocessableEntity, "invalid_ic", "Tarikh lahir dalam nombor kad pengenalan tidak sah.")
 		return
 	}
-	if err := a.saveSprVoter(ctx, res.IC, info, *res.Voter); err != nil {
+	if err := a.saveSprVoter(ctx, res.IC, info, *res.Voter, res.RawFields); err != nil {
 		a.fail(w, "save spr voter", err)
 		return
 	}
@@ -440,19 +495,45 @@ func (a *App) sprFound(w http.ResponseWriter, r *http.Request, job string, res s
 		a.fail(w, "load spr voter", err)
 		return
 	}
+	a.writeVoterResult(w, r, voter, false)
+}
+
+// storedSprVoter returns the voter's portal-confirmed record if we have one that is fresh enough
+// (SPR_REUSE_MAX_AGE, 0 = any age), else nil.
+func (a *App) storedSprVoter(ctx context.Context, ic string) (*Voter, error) {
+	v, err := a.voterFromDB(ctx, ic)
+	if errors.Is(err, errNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if v.Source != "spr" || v.VerifiedAt == nil {
+		return nil, nil
+	}
+	if a.cfg.SPRReuseMaxAge > 0 && time.Since(*v.VerifiedAt) > a.cfg.SPRReuseMaxAge {
+		return nil, nil
+	}
+	return &v, nil
+}
+
+// writeVoterResult sends what the voter flow needs next: record, candidates, questions, their
+// previous answers and the token that lets them submit the survey.
+func (a *App) writeVoterResult(w http.ResponseWriter, r *http.Request, voter Voter, reused bool) {
+	ctx := r.Context()
 	contests, contestsErr := a.voterContests(ctx, voter)
 	qs, err := a.getQuestions(ctx)
 	if err != nil {
 		a.fail(w, "spr questions", err)
 		return
 	}
-	prev, err := a.getPreviousResponse(ctx, res.IC)
+	prev, err := a.getPreviousResponse(ctx, voter.IC)
 	if err != nil {
 		a.fail(w, "spr previous response", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, lookupResponse{Voter: voter, Contests: contests, ContestsError: contestsErr, Questions: qs,
-		PreviousResponse: prev, VoterToken: a.voterToken(res.IC, time.Now())})
+		PreviousResponse: prev, VoterToken: a.voterToken(voter.IC, time.Now()), Reused: reused})
 }
 
 // sprLocalityCode keeps the portal's own locality code; when the portal shows none, a stable
@@ -470,7 +551,7 @@ func validSprVoter(v sprVoter) bool {
 	return v.FullName != "" && v.State != "" && len(v.Parlimen.Code) == 3 && normalizeIC(v.Parlimen.Code) == v.Parlimen.Code
 }
 
-func (a *App) saveSprVoter(ctx context.Context, ic string, info ICInfo, v sprVoter) error {
+func (a *App) saveSprVoter(ctx context.Context, ic string, info ICInfo, v sprVoter, raw []sprField) error {
 	if !validSprVoter(v) {
 		return errors.New("spr voter failed validation")
 	}
@@ -489,13 +570,18 @@ func (a *App) saveSprVoter(ctx context.Context, ic string, info ICInfo, v sprVot
 		v.DaerahMengundi.Name, v.Lokaliti.Name); err != nil {
 		return err
 	}
+	if raw == nil {
+		raw = []sprField{}
+	}
+	rawJSON, _ := json.Marshal(raw)
 	if _, err := tx.Exec(ctx, `INSERT INTO voters (ic, full_name, dob, gender, locality_code, is_demo, source, verified_at,
-			polling_centre, stream, voting_time)
-		VALUES ($1, $2, $3, $4, $5, false, 'spr', now(), $6, $7, $8)
+			polling_centre, stream, voting_time, spr_fields)
+		VALUES ($1, $2, $3, $4, $5, false, 'spr', now(), $6, $7, $8, $9)
 		ON CONFLICT (ic) DO UPDATE SET full_name = EXCLUDED.full_name, dob = EXCLUDED.dob, gender = EXCLUDED.gender,
 			locality_code = EXCLUDED.locality_code, is_demo = false, source = 'spr', verified_at = now(),
-			polling_centre = EXCLUDED.polling_centre, stream = EXCLUDED.stream, voting_time = EXCLUDED.voting_time`,
-		ic, v.FullName, info.DOB, info.Gender, code, v.PollingCentre, v.Stream, v.VotingTime); err != nil {
+			polling_centre = EXCLUDED.polling_centre, stream = EXCLUDED.stream, voting_time = EXCLUDED.voting_time,
+			spr_fields = EXCLUDED.spr_fields`,
+		ic, v.FullName, info.DOB, info.Gender, code, v.PollingCentre, v.Stream, v.VotingTime, rawJSON); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -590,6 +676,11 @@ func (a *App) purgeLoop(ctx context.Context) {
 // purgeOnce deletes SPR voter rows nobody submitted a survey for (and their cached copies) once
 // they are older than SPR_VOTER_RETENTION, and audit rows older than SPR_AUDIT_RETENTION.
 func (a *App) purgeOnce(ctx context.Context) error {
+	if a.cfg.SPRVoterRetention <= 0 { // 0 = keep every confirmed record (the default)
+		_, err := a.db.Exec(ctx, `DELETE FROM spr_lookups WHERE created_at < now() - make_interval(secs => $1)`,
+			a.cfg.SPRAuditRetention.Seconds())
+		return err
+	}
 	rows, err := a.db.Query(ctx, `DELETE FROM voters v WHERE v.source = 'spr' AND v.verified_at < now() - make_interval(secs => $1)
 			AND NOT EXISTS (SELECT 1 FROM responses r WHERE r.ic = v.ic) RETURNING v.ic`, a.cfg.SPRVoterRetention.Seconds())
 	if err != nil {

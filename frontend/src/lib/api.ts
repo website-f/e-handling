@@ -16,6 +16,8 @@ export type Voter = {
   polling_centre?: string;
   stream?: string;
   voting_time?: string;
+  /** When MySPR last confirmed this record (SPR mode). */
+  verified_at?: string;
 };
 
 export type CandidateRecord = { uid: string; contests: number; won: number; lost: number };
@@ -82,6 +84,8 @@ export type LookupResult = {
   previous_response: { answers: Answers; updated_at: string } | null;
   /** SPR mode: proves this browser completed the portal check; needed to submit the survey. */
   voter_token?: string;
+  /** SPR mode: answered from the record confirmed on an earlier visit, without a new portal check. */
+  reused?: boolean;
 };
 
 export type AppConfig = { voter_source: "demo" | "spr"; demo: boolean };
@@ -131,14 +135,21 @@ export const api = {
   config: () => request<AppConfig>("/api/v1/config"),
   lookup: (ic: string) =>
     request<LookupResult>("/api/v1/voters/lookup", { method: "POST", body: JSON.stringify({ ic }) }),
-  sprStart: (ic: string) =>
-    request<SprChallenge>("/api/v1/spr/lookups", { method: "POST", body: JSON.stringify({ ic }) }),
+  /** A CAPTCHA to solve, or straight away the stored record when this IC was confirmed before. */
+  sprStart: (ic: string, refresh = false) =>
+    request<SprChallenge | LookupResult>("/api/v1/spr/lookups", { method: "POST", body: JSON.stringify({ ic, refresh }) }),
   /** Either the voter's record (portal accepted the CAPTCHA) or a new challenge. */
   sprAnswer: (jobId: string, answer: string) =>
     request<LookupResult | SprChallenge>(`/api/v1/spr/lookups/${encodeURIComponent(jobId)}/captcha`, {
       method: "POST",
       body: JSON.stringify({ answer }),
     }),
+  /** Frees the portal session. `beacon` survives the tab closing. */
+  sprCancel: (jobId: string, beacon = false) => {
+    const url = `/api/v1/spr/lookups/${encodeURIComponent(jobId)}/cancel`;
+    if (beacon && navigator.sendBeacon) return void navigator.sendBeacon(url);
+    void fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+  },
   sprRefresh: (jobId: string) =>
     request<SprChallenge>(`/api/v1/spr/lookups/${encodeURIComponent(jobId)}/refresh`, { method: "POST", body: "{}" }),
   submit: (ic: string, answers: Answers, voterToken?: string) =>

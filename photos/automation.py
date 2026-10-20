@@ -332,6 +332,11 @@ class CamoufoxBrowser:
                 self._browser = await self._manager.__aenter__()
             return self._browser
 
+    async def warm(self) -> None:
+        """Launch now so the first user does not wait for Firefox to start."""
+        await self._ensure()
+        self.last_used = time.monotonic()
+
     async def new_context(self):
         """Fresh cookie jar (one per voter session). Caller must hold a slot and close it."""
         browser = await self._ensure()

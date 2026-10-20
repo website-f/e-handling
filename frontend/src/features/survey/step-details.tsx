@@ -1,8 +1,8 @@
 import type { ReactNode } from "react";
-import { ArrowRight, IdentificationCard, MapPinArea, SealCheck } from "@phosphor-icons/react";
+import { ArrowClockwise, ArrowRight, IdentificationCard, MapPinArea, SealCheck } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
 import type { Area, Voter } from "@/lib/api";
-import { formatDateMs, formatIC } from "@/lib/format";
+import { formatDateMs, formatDateTimeMs, formatIC } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { BackLink, StepHeading, StickyActions } from "./shared";
 
@@ -27,7 +27,20 @@ function AreaValue({ area }: { area: Area }) {
   );
 }
 
-export function DetailsStep({ voter, onNext, onBack }: { voter: Voter; onNext: () => void; onBack: () => void }) {
+export function DetailsStep({
+  voter,
+  reused = false,
+  onRecheck,
+  onNext,
+  onBack,
+}: {
+  voter: Voter;
+  /** Shown from the record confirmed on an earlier visit (no new portal check). */
+  reused?: boolean;
+  onRecheck?: () => void;
+  onNext: () => void;
+  onBack: () => void;
+}) {
   const levels: { label: string; value: ReactNode }[] = [
     ...(voter.polling_centre
       ? [{
@@ -52,6 +65,22 @@ export function DetailsStep({ voter, onNext, onBack }: { voter: Voter; onNext: (
     <>
       <BackLink onClick={onBack} label="Bukan saya, semak semula" />
       <StepHeading title="Maklumat Pemilih" lead="Sila pastikan maklumat di bawah adalah maklumat anda." />
+
+      {reused && (
+        <div className="mb-5 flex flex-col gap-3 rounded-2xl border bg-primary-soft p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
+          <p className="text-base">
+            Maklumat ini telah disahkan oleh portal SPR
+            {voter.verified_at && <> pada <span className="font-bold">{formatDateTimeMs(voter.verified_at)}</span></>}.
+            Jika anda telah bertukar alamat mengundi, semak semula.
+          </p>
+          {onRecheck && (
+            <Button variant="outline" onClick={onRecheck} className="shrink-0">
+              <ArrowClockwise size={20} weight="bold" />
+              Semak semula di portal SPR
+            </Button>
+          )}
+        </div>
+      )}
 
       <div className="grid gap-5">
         {/* Personal details, shaped like an ID card */}

@@ -42,6 +42,22 @@ export function SurveyFlow() {
     api.config().then(setConfig, () => setConfig({ voter_source: "demo", demo: true }));
   }, []);
 
+  // A portal session holds one of a limited number of browser slots: give it back as soon as the
+  // voter leaves the CAPTCHA screen (Back button, start over) or closes the tab.
+  const openJob = phase.name === "captcha" ? challenge?.job_id : undefined;
+  const liveJob = React.useRef<string | undefined>(undefined);
+  liveJob.current = challenge?.job_id; // cleared when the lookup ends (record shown or error)
+  React.useEffect(() => {
+    if (!openJob) return;
+    const onHide = () => api.sprCancel(openJob, true);
+    window.addEventListener("pagehide", onHide);
+    return () => {
+      window.removeEventListener("pagehide", onHide);
+      // Left the captcha screen while the session is still open (Back, start over): cancel it.
+      if (liveJob.current === openJob) api.sprCancel(openJob);
+    };
+  }, [openJob]);
+
   // Forward moves push a history entry so the phone's Back button walks back one screen
   // instead of leaving the site.
   const forward = React.useCallback((next: Phase) => {
@@ -85,14 +101,19 @@ export function SurveyFlow() {
   }
 
   // SPR mode: open the portal for this IC, then show the voter the portal's CAPTCHA.
-  async function sprStart(digits: string) {
+  // `refresh`: the voter asked to re-check on the portal instead of using their stored record.
+  async function sprStart(digits: string, refresh = false) {
     setIc(digits);
     setIcError(null);
     setCaptchaError(null);
     setPhase({ name: "loading" });
     try {
-      const ch = await api.sprStart(digits);
-      setChallenge(ch);
+      const res = await api.sprStart(digits, refresh);
+      if ("voter" in res) {
+        showRecord(res); // confirmed on an earlier visit: no CAPTCHA needed
+        return;
+      }
+      setChallenge(res);
       forward({ name: "captcha" });
     } catch (err) {
       failToIc(err);
@@ -182,7 +203,15 @@ export function SurveyFlow() {
       screen = <LoadingStep />;
       break;
     case "details":
-      screen = <DetailsStep voter={data!.voter} onNext={() => forward({ name: "candidates" })} onBack={back} />;
+      screen = (
+        <DetailsStep
+          voter={data!.voter}
+          reused={!!data!.reused}
+          onRecheck={() => sprStart(ic, true)}
+          onNext={() => forward({ name: "candidates" })}
+          onBack={back}
+        />
+      );
       break;
     case "candidates":
       screen = (

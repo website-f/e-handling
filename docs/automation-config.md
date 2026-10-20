@@ -12,7 +12,8 @@ not ways to look less automated.
 | `SPR_INTERNAL_TOKEN` | (none) | Shared secret between `api` and `spr`. Required when `VOTER_SOURCE=spr`. `deploy/remote-up.sh` generates one. |
 | `SPR_WORKER_URL` | `http://spr:8090` | Where the API reaches the lookup service (compose network only). |
 | `SPR_REQUIRE_CANDIDATE_PHASE` | `true` | Lookups stay closed (`503 candidates_not_ready`) until the latest candidates phase is `completed` or `completed_with_warnings`. |
-| `SPR_VOTER_RETENTION` | `24h` | SPR-confirmed voter rows with no survey response are deleted after this (hourly purge; their cache entries too). |
+| `SPR_REUSE_MAX_AGE` | `0` | A voter whose IC was already confirmed on the portal is answered from the stored record, with no CAPTCHA and no portal session (audited as `reused`). `0` = reuse at any age; e.g. `720h` sends records older than 30 days back to the portal. The voter can always press "Semak semula di portal SPR". |
+| `SPR_VOTER_RETENTION` | `0` | `0` keeps every confirmed record (and its verbatim `spr_fields`). A duration (e.g. `24h`) deletes records with no survey response after that long (hourly purge; cache entries too). |
 | `SPR_AUDIT_RETENTION` | `2160h` (90 days) | `spr_lookups` audit rows are deleted after this. |
 
 ## Lookup service (`spr`)
@@ -20,8 +21,11 @@ not ways to look less automated.
 | Variable | Default | Meaning |
 |---|---|---|
 | `SPR_URL` | `https://mysprsemak.spr.gov.my/semakan/daftarPemilih` | The portal form. |
-| `SPR_MAX_CONCURRENT_PAGES` | `3` | Voter sessions (isolated browser contexts) open at once. Extra voters wait up to `SPR_SLOT_WAIT_S`, then get "busy". |
-| `SPR_SLOT_WAIT_S` | `15` | How long a new lookup waits for a free session slot. |
+| `SPR_MAX_CONCURRENT_PAGES` | `12` | Voter sessions (isolated browser contexts, ~60-80 MB each) open at once in one warm Firefox. A slot is held from IC entry until the portal answers, or freed at once when the voter goes Back / closes the tab. Extra voters queue up to `SPR_SLOT_WAIT_S`, then get "busy". Raise it together with the container's `mem_limit` (3 GB). |
+| `SPR_SLOT_WAIT_S` | `30` | How long a new lookup queues for a free session slot. |
+| `SPR_BLOCK_ASSETS` | `true` | Skip fonts, media, decorative images and third-party hosts in portal sessions (each starts with an empty cache). The portal's pages, scripts, styles and CAPTCHA still load. |
+| `SPR_BROWSER_IDLE_CLOSE_S` | `1800` | Firefox is launched at start-up and closed only after this long with no sessions. |
+| `SPR_MIN_ACTION_INTERVAL_MS` / `SPR_MAX_ACTION_INTERVAL_MS` | `100` / `250` | Compose maps these to `EXEC_*_ACTION_INTERVAL_MS` for the `spr` service: the gap between portal actions across all voters. |
 | `SPR_SESSION_TTL_S` | `240` | A session not finished within this is closed (`expired`). |
 | `SPR_MAX_CAPTCHA_ATTEMPTS` | `3` | Wrong CAPTCHAs allowed per session before it ends (`too_many_attempts`). |
 | `SPR_MAX_REFRESHES` | `5` | "Gambar lain" presses allowed per session. |

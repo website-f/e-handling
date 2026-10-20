@@ -18,7 +18,7 @@ fi
 ensure_key() { grep -q "^$1=" .env || echo "$1=$2" >> .env; }
 ensure_key VOTER_SOURCE demo
 ensure_key SPR_REQUIRE_CANDIDATE_PHASE true
-ensure_key SPR_MAX_CONCURRENT_PAGES 3
+ensure_key SPR_MAX_CONCURRENT_PAGES 12
 if ! grep -q '^SPR_INTERNAL_TOKEN=.' .env; then
   sed -i '/^SPR_INTERNAL_TOKEN=/d' .env
   echo "SPR_INTERNAL_TOKEN=$(openssl rand -hex 24)" >> .env

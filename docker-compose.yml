@@ -51,7 +51,9 @@ services:
       SPR_WORKER_URL: http://spr:8090
       SPR_INTERNAL_TOKEN: ${SPR_INTERNAL_TOKEN:-}
       SPR_REQUIRE_CANDIDATE_PHASE: ${SPR_REQUIRE_CANDIDATE_PHASE:-true}
-      SPR_VOTER_RETENTION: ${SPR_VOTER_RETENTION:-24h}
+      # Confirmed records are kept and reused for repeat visits (0 = keep / reuse regardless of age).
+      SPR_VOTER_RETENTION: ${SPR_VOTER_RETENTION:-0}
+      SPR_REUSE_MAX_AGE: ${SPR_REUSE_MAX_AGE:-0}
       SPR_AUDIT_RETENTION: ${SPR_AUDIT_RETENTION:-2160h}
     depends_on:
       db: { condition: service_healthy }
@@ -86,12 +88,18 @@ services:
     command: ["python", "spr.py"]
     environment:
       SPR_INTERNAL_TOKEN: ${SPR_INTERNAL_TOKEN:-}
-      SPR_MAX_CONCURRENT_PAGES: ${SPR_MAX_CONCURRENT_PAGES:-3}
+      # Each voter holds one browser context (~60-80 MB) from IC entry until the portal answers.
+      SPR_MAX_CONCURRENT_PAGES: ${SPR_MAX_CONCURRENT_PAGES:-12}
+      SPR_SLOT_WAIT_S: ${SPR_SLOT_WAIT_S:-30}
       SPR_SESSION_TTL_S: ${SPR_SESSION_TTL_S:-240}
       SPR_MAX_CAPTCHA_ATTEMPTS: ${SPR_MAX_CAPTCHA_ATTEMPTS:-3}
       BROWSER_HEADLESS: ${BROWSER_HEADLESS:-true}
-    shm_size: 1gb
-    mem_limit: 1500m
+      # Gap between portal actions across all voters (one shared queue per host): short, so 12
+      # voters do not wait seconds behind each other, while still spacing requests to SPR.
+      EXEC_MIN_ACTION_INTERVAL_MS: ${SPR_MIN_ACTION_INTERVAL_MS:-100}
+      EXEC_MAX_ACTION_INTERVAL_MS: ${SPR_MAX_ACTION_INTERVAL_MS:-250}
+    shm_size: 2gb
+    mem_limit: 3g
     restart: unless-stopped
 
   gateway:

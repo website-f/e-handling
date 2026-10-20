@@ -45,7 +45,7 @@ func TestSprFlowIntegration(t *testing.T) {
 	}
 
 	// Fake worker: awaiting_captcha on start, wrong captcha first, then a found record.
-	var submits atomic.Int32
+	var submits, starts atomic.Int32
 	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Internal-Token") != "tok" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -56,6 +56,7 @@ func TestSprFlowIntegration(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/sessions":
+			starts.Add(1)
 			if body["ic"] != testIC {
 				t.Errorf("worker got ic %q, want the submitted one", body["ic"])
 			}
@@ -68,7 +69,8 @@ func TestSprFlowIntegration(t *testing.T) {
 			_, _ = io.WriteString(w, `{"status":"found","ic":"`+testIC+`","voter":{"full_name":"PEMILIH UJIAN","state":"SABAH",
 				"parlimen":{"code":"173","name":"PUTATAN"},"dun":{"code":"173/23","name":"PETAGAS"},
 				"daerah_mengundi":{"code":"173/23/01","name":"CONTOH"},"lokaliti":{"code":"","name":"KG UJIAN"},
-				"polling_centre":"SK UJIAN","stream":"2","voting_time":""}}`)
+				"polling_centre":"SK UJIAN","stream":"2","voting_time":""},
+				"raw_fields":[{"label":"Nama","value":"PEMILIH UJIAN"},{"label":"Status Pemilih","value":"BIASA"}]}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -160,6 +162,48 @@ func TestSprFlowIntegration(t *testing.T) {
 	var leaked int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM spr_lookups WHERE row_to_json(spr_lookups)::text LIKE '%`+testIC+`%'`).Scan(&leaked); err != nil || leaked != 0 {
 		t.Fatalf("raw IC in audit table: %d %v", leaked, err)
+	}
+
+	// Everything the portal showed is stored verbatim, including rows we do not parse.
+	var raw string
+	if err := pool.QueryRow(ctx, `SELECT spr_fields::text FROM voters WHERE ic = $1`, testIC).Scan(&raw); err != nil ||
+		!strings.Contains(raw, `"Status Pemilih"`) {
+		t.Fatalf("spr_fields: %q %v", raw, err)
+	}
+
+	// 5a. Same IC again: answered from the stored record, no portal session, still audited.
+	startsBefore := starts.Load()
+	code, out = call("POST", "/api/v1/spr/lookups", `{"ic":"`+testIC+`"}`)
+	if code != 200 || out["reused"] != true || out["voter"] == nil || out["voter_token"] == "" {
+		t.Fatalf("reuse: %d %v", code, out)
+	}
+	if starts.Load() != startsBefore {
+		t.Fatal("stored record should skip the portal")
+	}
+	var reused int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM spr_lookups WHERE status = 'reused'`).Scan(&reused)
+	if reused != 1 {
+		t.Fatalf("reused audit rows = %d", reused)
+	}
+	// SPR_REUSE_MAX_AGE: an older record goes back to the portal.
+	a.cfg.SPRReuseMaxAge = time.Minute
+	_, _ = pool.Exec(ctx, `UPDATE voters SET verified_at = now() - interval '1 hour' WHERE ic = $1`, testIC)
+	if code, out := call("POST", "/api/v1/spr/lookups", `{"ic":"`+testIC+`"}`); code != 200 || out["status"] != "awaiting_captcha" {
+		t.Fatalf("stale record should re-check: %d %v", code, out)
+	}
+	a.cfg.SPRReuseMaxAge = 0
+
+	// 5b. "Semak semula" forces the portal; leaving the CAPTCHA screen cancels the session.
+	code, out = call("POST", "/api/v1/spr/lookups", `{"ic":"`+testIC+`","refresh":true}`)
+	if code != 200 || out["status"] != "awaiting_captcha" {
+		t.Fatalf("refresh start: %d %v", code, out)
+	}
+	job2 := out["job_id"].(string)
+	if code, _ := call("POST", "/api/v1/spr/lookups/"+job2+"/cancel", ``); code != 200 {
+		t.Fatalf("cancel = %d", code)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM spr_lookups WHERE id = $1`, job2).Scan(&auditStatus); err != nil || auditStatus != "cancelled" {
+		t.Fatalf("cancelled audit: %q %v", auditStatus, err)
 	}
 
 	// 6. Survey: rejected without the token, accepted with it.
