@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,6 +29,21 @@ type Config struct {
 
 	ElectionDataURL string
 	ElectionDataKey string
+
+	// VOTER_SOURCE=spr: voters are confirmed on MySPR Semak (spr.go) instead of the demo register.
+	VoterSource          string
+	SPRWorkerURL         string
+	SPRInternalToken     string
+	SPRRequireCandidates bool          // lookups wait for the candidates phase to complete
+	SPRVoterRetention    time.Duration // SPR voter rows without a survey response
+	SPRAuditRetention    time.Duration
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(key)); err == nil && d > 0 {
+		return d
+	}
+	return def
 }
 
 func env(key, def string) string {
@@ -43,18 +59,30 @@ func loadConfig() Config {
 	if err != nil {
 		ttl = 10 * time.Minute
 	}
+	source := env("VOTER_SOURCE", "demo")
+	if source != "spr" {
+		source = "demo"
+	}
 	return Config{
-		Addr:         env("ADDR", ":8080"),
-		DatabaseURL:  env("DATABASE_URL", "postgres://ehandling:ehandling@localhost:5432/ehandling"),
-		RedisURL:     os.Getenv("REDIS_URL"),
-		AdminAPIKey:  os.Getenv("ADMIN_API_KEY"),
-		IPHashSalt:   env("IP_HASH_SALT", "change-me"),
-		DemoFallback: env("DEMO_FALLBACK", "true") == "true",
+		Addr:        env("ADDR", ":8080"),
+		DatabaseURL: env("DATABASE_URL", "postgres://ehandling:ehandling@localhost:5432/ehandling"),
+		RedisURL:    os.Getenv("REDIS_URL"),
+		AdminAPIKey: os.Getenv("ADMIN_API_KEY"),
+		IPHashSalt:  env("IP_HASH_SALT", "change-me"),
+		// Real lookups never fall back to invented voters.
+		DemoFallback: source == "demo" && env("DEMO_FALLBACK", "true") == "true",
 		CacheTTL:     ttl,
 		DBMaxConns:   int32(maxConns),
 
 		ElectionDataURL: env("ELECTIONDATA_URL", "https://api.electiondata.my/v1"),
 		ElectionDataKey: os.Getenv("ELECTIONDATA_API_KEY"),
+
+		VoterSource:          source,
+		SPRWorkerURL:         strings.TrimRight(env("SPR_WORKER_URL", "http://spr:8090"), "/"),
+		SPRInternalToken:     os.Getenv("SPR_INTERNAL_TOKEN"),
+		SPRRequireCandidates: env("SPR_REQUIRE_CANDIDATE_PHASE", "true") == "true",
+		SPRVoterRetention:    envDuration("SPR_VOTER_RETENTION", 24*time.Hour),
+		SPRAuditRetention:    envDuration("SPR_AUDIT_RETENTION", 90*24*time.Hour),
 	}
 }
 
@@ -66,6 +94,7 @@ type App struct {
 	localities []string      // locality codes, loaded once after migration (used by demo fallback)
 	ed         *ElectionData // nil when ELECTIONDATA_API_KEY is unset
 	photos     photoState
+	gate       gateCache
 }
 
 func main() {
@@ -89,6 +118,9 @@ func run(cfg Config, log *slog.Logger) error {
 
 	if cfg.AdminAPIKey == "" {
 		return errors.New("ADMIN_API_KEY is required")
+	}
+	if cfg.VoterSource == "spr" && cfg.SPRInternalToken == "" {
+		return errors.New("SPR_INTERNAL_TOKEN is required when VOTER_SOURCE=spr")
 	}
 
 	pool, err := connectDB(ctx, cfg, log)
@@ -120,6 +152,7 @@ func run(cfg Config, log *slog.Logger) error {
 
 	app.ed = newElectionData(app)
 	go app.watchPhotos(ctx)
+	go app.purgeLoop(ctx)
 	if app.ed == nil {
 		log.Warn("ELECTIONDATA_API_KEY not set; candidate lists are disabled")
 	} else {
@@ -146,7 +179,8 @@ func run(cfg Config, log *slog.Logger) error {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Info("listening", "addr", cfg.Addr, "demo_fallback", cfg.DemoFallback, "cache", app.rdb != nil)
+	log.Info("listening", "addr", cfg.Addr, "voter_source", cfg.VoterSource, "demo_fallback", cfg.DemoFallback,
+		"cache", app.rdb != nil)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

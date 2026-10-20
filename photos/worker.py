@@ -6,9 +6,15 @@ Works the `candidate_photos` queue (rows are enqueued by the API whenever it ser
      their party or seat. Accurate and freely licensed, so it can be auto-approved.
   2. Otherwise a Camoufox (stealth Firefox) Bing Images search for `"name" party seat`.
 
-Every image is face-checked with OpenCV: no face, a tiny face or a crowd shot is rejected, and
-portraits are cropped square around the face and saved as WebP. Web results are only ever
-`pending` (shown to voters after an admin approves one) unless PHOTO_AUTO_APPROVE=all.
+Every download is validated (HTTP status, Content-Type, real file signature, size limit) and
+hashed (SHA-256); a picture already used for a different candidate is never reused. Every image
+is face-checked with OpenCV: no face, a tiny face or a crowd shot is rejected, and portraits are
+cropped square around the face and saved as WebP. Web results are only ever `pending` (shown to
+voters after an admin approves one) unless PHOTO_AUTO_APPROVE allows it. Each finished candidate
+gets <PHOTO_DIR>/meta/<uid>.json with source URLs, checksums and retrieval times.
+
+Resumable: rows left in `searching` by a crash go back to `queued` at start-up, and finished rows
+(and their files) are never re-downloaded unless an admin presses "retry".
 
   python worker.py                    # run the queue forever
   python worker.py --test "Name" PARTY "Seat"   # dry run for one candidate, prints what it finds
@@ -30,6 +36,7 @@ import socket
 import sys
 import time
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 from urllib.parse import quote, quote_plus, urlparse
 
 import cv2
@@ -37,6 +44,10 @@ import httpx
 import numpy as np
 import psycopg
 from PIL import Image, ImageOps
+
+import images
+import settings as settings_mod
+from automation import CamoufoxBrowser, SecurityChallenge, detect_challenge, normalize_url
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("photos")
@@ -50,6 +61,8 @@ MODEL_DIR = os.environ.get("PHOTO_MODEL_DIR", "/app/models")
 SAME_FACE = float(os.environ.get("PHOTO_SAME_FACE", "0.50"))
 PACE = float(os.environ.get("PHOTO_PACE_SECONDS", "6"))  # gap between candidates (polite to Bing)
 BROWSER_IDLE_CLOSE = 300  # seconds; frees ~500 MB when the queue is empty
+CHALLENGE_COOLDOWN_MIN = int(os.environ.get("PHOTO_CHALLENGE_COOLDOWN_MIN", "30"))
+SETTINGS = settings_mod.load()
 MAX_OPTIONS = 4
 MAX_ATTEMPTS = 3
 OUT_SIZE = 384
@@ -90,13 +103,18 @@ class Option:
     faces: int = 1
     score: float = 0.0
     agree: int = 0  # how many other sites carry the same face (0 = unconfirmed)
+    sha256: str = ""  # of the original download (duplicate detection across candidates)
+    width: int = 0
+    height: int = 0
+    retrieved_at: str = ""
     meta: dict = field(default_factory=dict)
 
     def as_json(self) -> dict:
         return {
             "path": self.path, "source": self.source, "source_url": self.source_url,
             "page_url": self.page_url, "title": self.title[:200], "faces": self.faces,
-            "score": round(self.score, 2), "agree": self.agree,
+            "score": round(self.score, 2), "agree": self.agree, "sha256": self.sha256,
+            "width": self.width, "height": self.height, "retrieved_at": self.retrieved_at,
         }
 
 
@@ -142,8 +160,11 @@ def _public_host(host: str) -> bool:
     return True
 
 
-async def download(client: httpx.AsyncClient, url: str, max_bytes: int = 6 << 20) -> bytes | None:
-    """Fetch an image from the public internet only (never the compose network)."""
+async def download(client: httpx.AsyncClient, url: str) -> tuple[bytes, images.Checked] | None:
+    """Fetch an image from the public internet only (never the compose network) and validate it:
+    200, an image Content-Type, an allowed file signature and the size limit."""
+    cfg = SETTINGS.images
+    max_bytes = cfg.max_bytes
     try:
         u = urlparse(url)
         if u.scheme not in ("http", "https") or not u.hostname:
@@ -152,22 +173,37 @@ async def download(client: httpx.AsyncClient, url: str, max_bytes: int = 6 << 20
             return None
         ua = WIKI_UA if u.hostname.endswith("wikimedia.org") else WEB_UA
         for attempt in range(2):
-            async with client.stream("GET", url, headers={"User-Agent": ua, "Accept": "image/*"}, timeout=12) as r:
+            async with client.stream("GET", url, headers={"User-Agent": ua, "Accept": "image/*"},
+                                     timeout=cfg.download_timeout_s) as r:
                 if r.status_code == 429:
-                    if attempt == 0:
-                        await asyncio.sleep(float(r.headers.get("retry-after", "5") or 5))
+                    ra = r.headers.get("retry-after", "")
+                    wait = float(ra) if ra.isdigit() else 5.0
+                    if attempt == 0 and wait <= SETTINGS.requests.maximum_retry_after_s:
+                        await asyncio.sleep(wait)
                         continue
                     if u.hostname.endswith("wikimedia.org"):
                         raise RateLimited("wikipedia rate limited (429) on image")
                     return None
-                if r.status_code != 200 or not r.headers.get("content-type", "").startswith("image/"):
+                ctype = r.headers.get("content-type", "")
+                if r.status_code != 200 or not images.content_type_ok(ctype):
+                    return None
+                declared = r.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > max_bytes:
                     return None
                 buf = bytearray()
                 async for chunk in r.aiter_bytes():
                     buf += chunk
                     if len(buf) > max_bytes:
                         return None
-                return bytes(buf)
+                # A dropped connection mid-body leaves a short file: never keep a truncated image.
+                if declared.isdigit() and r.headers.get("content-encoding") is None and int(declared) != len(buf):
+                    return None
+                data = bytes(buf)
+                if cfg.verify_download:
+                    checked = images.check(data, ctype, cfg.allowed_formats, max_bytes)
+                else:
+                    checked = images.Checked(fmt=images.sniff(data) or "", sha256=images.sha256(data), size=len(data))
+                return (data, checked) if checked else None
         return None
     except (httpx.HTTPError, ValueError):
         return None
@@ -176,8 +212,9 @@ async def download(client: httpx.AsyncClient, url: str, max_bytes: int = 6 << 20
 # ---------------------------------------------------------------- face crop
 
 
-def face_crop(data: bytes) -> tuple[bytes, int] | None:
-    """Square crop around the largest face, as WebP. None if this isn't a usable portrait."""
+def face_crop(data: bytes) -> tuple[bytes, int, int, int] | None:
+    """Square crop around the largest face, as WebP, plus face count and original size.
+    None if this isn't a usable portrait."""
     try:
         img = Image.open(io.BytesIO(data))
         img = ImageOps.exif_transpose(img).convert("RGB")
@@ -199,7 +236,7 @@ def face_crop(data: bytes) -> tuple[bytes, int] | None:
     crop = img.crop((left, top, left + int(side), top + int(side))).resize((OUT_SIZE, OUT_SIZE), Image.LANCZOS)
     out = io.BytesIO()
     crop.save(out, "WEBP", quality=82, method=5)
-    return out.getvalue(), len(faces)
+    return out.getvalue(), len(faces), w, h
 
 
 def save_photo(uid: str, webp: bytes) -> str:
@@ -214,20 +251,39 @@ def save_photo(uid: str, webp: bytes) -> str:
     return f"/photos/{fname}"
 
 
-async def to_option(client: httpx.AsyncClient, cand: Cand, src: dict, seen: set[str]) -> Option | None:
-    data = await download(client, src["url"])
-    if not data:
+# async (sha256, uid) -> uid of another candidate already using this exact image, or None
+OwnerOf = Callable[[str, str], Awaitable["str | None"]]
+
+
+async def to_option(client: httpx.AsyncClient, cand: Cand, src: dict, seen: set[str],
+                    owner_of: OwnerOf | None = None) -> Option | None:
+    key = normalize_url(src["url"])
+    if key in seen:  # same image URL reached through two results: download it once
         return None
+    seen.add(key)
+    got = await download(client, src["url"])
+    if not got:
+        return None
+    data, checked = got
+    if checked.sha256 in seen:  # same bytes behind two different URLs
+        return None
+    seen.add(checked.sha256)
+    if owner_of is not None:
+        other = await owner_of(checked.sha256, cand.uid)
+        if other:  # never give one candidate another candidate's picture
+            log.info("skip image already used by %s for uid=%s", other, cand.uid)
+            return None
     cropped = await asyncio.to_thread(face_crop, data)
     if not cropped:
         return None
-    webp, faces = cropped
+    webp, faces, w, h = cropped
     path = save_photo(cand.uid, webp)
-    if path in seen:  # same picture reached through two results
+    if path in seen:  # same crop reached through two results
         return None
     seen.add(path)
     return Option(path=path, source=src["source"], source_url=src["url"], page_url=src.get("page", ""),
-                  title=src.get("title", ""), faces=faces, score=src.get("score", 0.0))
+                  title=src.get("title", ""), faces=faces, score=src.get("score", 0.0), sha256=checked.sha256,
+                  width=w, height=h, retrieved_at=images.utcnow())
 
 
 # ---------------------------------------------------------------- consensus (face recognition)
@@ -333,35 +389,8 @@ async def wikipedia_sources(client: httpx.AsyncClient, cand: Cand) -> list[dict]
 # ---------------------------------------------------------------- source 2: Camoufox + Bing Images
 
 
-class Browser:
-    def __init__(self) -> None:
-        self.manager = None
-        self.browser = None
-        self.last_used = 0.0
-
-    async def page(self):
-        if self.browser is None:
-            from camoufox.async_api import AsyncCamoufox
-
-            log.info("launching camoufox")
-            self.manager = AsyncCamoufox(headless=True, humanize=False, block_webrtc=True, locale="en-US",
-                                         i_know_what_im_doing=True)
-            self.browser = await self.manager.__aenter__()
-        self.last_used = time.monotonic()
-        return await self.browser.new_page()
-
-    async def close_if_idle(self) -> None:
-        if self.browser is not None and time.monotonic() - self.last_used > BROWSER_IDLE_CLOSE:
-            await self.close()
-
-    async def close(self) -> None:
-        if self.manager is not None:
-            try:
-                await self.manager.__aexit__(None, None, None)
-            except Exception:  # noqa: BLE001
-                pass
-            log.info("camoufox closed")
-        self.manager = self.browser = None
+def Browser() -> CamoufoxBrowser:  # noqa: N802 - one shared Camoufox, closed when idle
+    return CamoufoxBrowser(SETTINGS, idle_close=BROWSER_IDLE_CLOSE)
 
 
 POLITICAL_TERMS = (
@@ -373,14 +402,20 @@ _IUSC_TAG = re.compile(r"<a\b[^>]*\bclass=\"[^\"]*\biusc\b[^\"]*\"[^>]*>", re.I)
 _M_ATTR = re.compile(r"\bm=\"([^\"]+)\"")
 
 
-async def bing_sources(browser: Browser, cand: Cand) -> list[dict]:
+async def bing_sources(browser: CamoufoxBrowser, cand: Cand) -> list[dict]:
     query = f'"{cand.name}" {cand.party} {cand.seat_name}'
     url = "https://www.bing.com/images/search?" + "q=" + quote_plus(query) + "&qft=+filterui:face-portrait&form=IRFLTR"
-    page = await browser.page()
+    page = await browser.new_page()
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        resp = await page.goto(url, wait_until=SETTINGS.browser.default_wait_until)
+        # Results render after load; this is the page's own settle time, not an anti-bot delay.
         await page.wait_for_timeout(random.randint(1800, 3200))
         content = await page.content()
+        if "iusc" not in content:  # no results grid: find out whether we were shown a block page
+            challenge = detect_challenge(resp.status if resp else None, await page.title(),
+                                         await page.evaluate("() => document.body ? document.body.innerText : ''"))
+            if challenge:
+                raise SecurityChallenge(challenge, "bing images")
     finally:
         await page.close()
 
@@ -413,10 +448,11 @@ async def bing_sources(browser: Browser, cand: Cand) -> list[dict]:
 # ---------------------------------------------------------------- one candidate
 
 
-async def find_photos(client: httpx.AsyncClient, browser: Browser, cand: Cand) -> tuple[list[Option], str]:
+async def find_photos(client: httpx.AsyncClient, browser: CamoufoxBrowser, cand: Cand,
+                      owner_of: OwnerOf | None = None) -> tuple[list[Option], str]:
     seen: set[str] = set()
     for src in await wikipedia_sources(client, cand):
-        opt = await to_option(client, cand, src, seen)
+        opt = await to_option(client, cand, src, seen, owner_of)
         if opt:
             return [opt], "wikipedia"
 
@@ -424,7 +460,7 @@ async def find_photos(client: httpx.AsyncClient, browser: Browser, cand: Cand) -
     web = await bing_sources(browser, cand)
     log.info("bing: %d relevant results for %r", len(web), cand.name)
     for src in web:
-        opt = await to_option(client, cand, src, seen)
+        opt = await to_option(client, cand, src, seen, owner_of)
         if opt:
             options.append(opt)
             if len(options) >= MAX_OPTIONS:
@@ -449,12 +485,45 @@ RETURNING uid, name, party, seat, state, attempts
 
 # Every result write is guarded by status='searching': if an admin approved, rejected or
 # re-queued the candidate while we were searching, their decision is kept.
-async def process(conn, client: httpx.AsyncClient, browser: Browser, row) -> None:
+def write_meta(cand: Cand, status: str, source: str | None, options: list[Option], error: str = "") -> None:
+    """<PHOTO_DIR>/meta/<uid>.json: what was found, from where, with checksums (gateway never serves it)."""
+    if not SETTINGS.images.save_metadata:
+        return
+    try:
+        images.write_metadata(os.path.join(PHOTO_DIR, "meta"), cand.uid, {
+            "name": cand.name, "party": cand.party, "seat": cand.seat, "download_status": status, "source": source,
+            "error": error[:300], "updated_at": images.utcnow(),
+            "images": [{**o.as_json(), "local_path": os.path.join(PHOTO_DIR, os.path.basename(o.path))} for o in options],
+        })
+    except OSError as e:
+        log.warning("metadata write failed uid=%s: %s", cand.uid, e)
+
+
+async def process(conn, client: httpx.AsyncClient, browser: CamoufoxBrowser, row) -> None:
     uid, name, party, seat, state, attempts = row
     cand = Cand(uid, name, party, seat, state)
     t0 = time.monotonic()
+
+    async def owner_of(sha: str, me: str) -> str | None:
+        cur = await conn.execute(
+            "SELECT uid FROM candidate_photos WHERE uid <> %s AND options @> %s::jsonb LIMIT 1",
+            (me, json.dumps([{"sha256": sha}])))
+        hit = await cur.fetchone()
+        return hit[0] if hit else None
+
     try:
-        options, source = await find_photos(client, browser, cand)
+        options, source = await find_photos(client, browser, cand, owner_of)
+    except SecurityChallenge as e:
+        # Bing showed a CAPTCHA / block page: pause web search for this candidate instead of retrying now.
+        log.warning("security challenge (%s) while searching uid=%s; retrying in %d min", e.kind, uid,
+                    CHALLENGE_COOLDOWN_MIN)
+        await browser.close()
+        await conn.execute(
+            "UPDATE candidate_photos SET status='queued', last_error=%s, attempts=attempts - 1,"
+            " queued_at=now() + make_interval(mins => %s), updated_at=now() WHERE uid=%s AND status='searching'",
+            (f"challenge: {e.kind}", CHALLENGE_COOLDOWN_MIN, uid))
+        write_meta(cand, "queued", None, [], f"challenge: {e.kind}")
+        return
     except Exception as e:  # noqa: BLE001 - one bad page must not stop the queue
         log.warning("search failed uid=%s name=%r: %s", uid, name, e)
         if not isinstance(e, RateLimited):
@@ -465,6 +534,7 @@ async def process(conn, client: httpx.AsyncClient, browser: Browser, row) -> Non
             "UPDATE candidate_photos SET status=%s, last_error=%s, attempts=attempts - %s,"
             " queued_at=now() + interval '10 minutes', updated_at=now() WHERE uid=%s AND status='searching'",
             (status, str(e)[:500], 1 if throttled else 0, uid))
+        write_meta(cand, "failed" if status == "error" else "queued", None, [], str(e))
         return
 
     if not options:
@@ -472,6 +542,7 @@ async def process(conn, client: httpx.AsyncClient, browser: Browser, row) -> Non
             "UPDATE candidate_photos SET status='not_found', options='[]', image_path=NULL, source=NULL, last_error=NULL,"
             " updated_at=now() WHERE uid=%s AND status='searching'",
             (uid,))
+        write_meta(cand, "completed_with_warnings", None, [], "no usable image found")
         log.info("not found uid=%s name=%r (%.1fs)", uid, name, time.monotonic() - t0)
         return
 
@@ -490,6 +561,7 @@ async def process(conn, client: httpx.AsyncClient, browser: Browser, row) -> Non
            WHERE uid=%s AND status='searching'""",
         ("approved" if auto else "pending", source, best.path, best.source_url, best.page_url,
          json.dumps([o.as_json() for o in options]), uid))
+    write_meta(cand, "completed", source, options)
     log.info("found uid=%s name=%r source=%s options=%d agree=%d status=%s (%.1fs)", uid, name, source, len(options),
              best.agree, "approved" if auto else "pending", time.monotonic() - t0)
 

@@ -1,4 +1,5 @@
-# Candidate photo worker: Camoufox (stealth Firefox) for web image search + OpenCV face crop.
+# Camoufox (Firefox) image for two services: the candidate photo worker (worker.py: web image
+# search + OpenCV face crop) and the MySPR Semak lookup service (spr.py). Same code, different CMD.
 # Same install recipe as Agentic-AI's browser service (deploy/browser.Dockerfile).
 FROM python:3.12-slim-trixie
 
@@ -24,7 +25,7 @@ RUN mkdir -p /app/models && python -c "import urllib.request as u; \
 b = 'https://github.com/opencv/opencv_zoo/raw/main/models/'; \
 u.urlretrieve(b + 'face_detection_yunet/face_detection_yunet_2023mar.onnx', '/app/models/face_detection_yunet_2023mar.onnx'); \
 u.urlretrieve(b + 'face_recognition_sface/face_recognition_sface_2021dec.onnx', '/app/models/face_recognition_sface_2021dec.onnx')"
-COPY --chown=app:app worker.py /app/
+COPY --chown=app:app *.py /app/
 WORKDIR /app
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "worker.py"]

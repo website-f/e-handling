@@ -13,6 +13,16 @@ if [[ ! -f .env ]]; then
   sed -i "s|^IP_HASH_SALT=.*|IP_HASH_SALT=$(openssl rand -hex 24)|" .env
   chmod 600 .env
 fi
+# Keys added after first deploy: append with a default, never overwrite what is there.
+[[ -z "$(tail -c1 .env)" ]] || echo >> .env
+ensure_key() { grep -q "^$1=" .env || echo "$1=$2" >> .env; }
+ensure_key VOTER_SOURCE demo
+ensure_key SPR_REQUIRE_CANDIDATE_PHASE true
+ensure_key SPR_MAX_CONCURRENT_PAGES 3
+if ! grep -q '^SPR_INTERNAL_TOKEN=.' .env; then
+  sed -i '/^SPR_INTERNAL_TOKEN=/d' .env
+  echo "SPR_INTERNAL_TOKEN=$(openssl rand -hex 24)" >> .env
+fi
 set -a; . ./.env; set +a
 
 echo "==> building and starting"

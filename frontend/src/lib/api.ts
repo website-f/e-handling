@@ -11,6 +11,11 @@ export type Voter = {
   daerah_mengundi: Area;
   lokaliti: Area;
   is_demo: boolean;
+  /** seed | demo | spr (confirmed on MySPR Semak) */
+  source: "seed" | "demo" | "spr";
+  polling_centre?: string;
+  stream?: string;
+  voting_time?: string;
 };
 
 export type CandidateRecord = { uid: string; contests: number; won: number; lost: number };
@@ -75,6 +80,20 @@ export type LookupResult = {
   contests_error: string;
   questions: Question[];
   previous_response: { answers: Answers; updated_at: string } | null;
+  /** SPR mode: proves this browser completed the portal check; needed to submit the survey. */
+  voter_token?: string;
+};
+
+export type AppConfig = { voter_source: "demo" | "spr"; demo: boolean };
+
+/** The portal is waiting for the voter to type the CAPTCHA shown in `captcha` (a PNG data URL). */
+export type SprChallenge = {
+  job_id: string;
+  status: "awaiting_captcha" | "captcha_wrong" | "captcha_expired" | "invalid_answer" | "portal_message" | "refresh_limit";
+  captcha: string;
+  attempts_left: number;
+  expires_in: number;
+  message?: string;
 };
 
 export type SubmitResult = { id: string; updated: boolean; submitted_at: string };
@@ -97,10 +116,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   } catch {
     throw new ApiError(0, "network", NETWORK_MESSAGE);
   }
-  if (res.status === 429) {
+  const body = await res.json().catch(() => null);
+  if (res.status === 429 && !body?.message) {
+    // The gateway's own rate limit (no JSON body); API 429s carry their own message.
     throw new ApiError(429, "rate_limited", "Terlalu ramai pengguna sekarang. Sila tunggu sebentar dan cuba lagi.");
   }
-  const body = await res.json().catch(() => null);
   if (!res.ok) {
     throw new ApiError(res.status, body?.error ?? "unknown", body?.message ?? "Ralat pelayan. Sila cuba lagi.");
   }
@@ -108,10 +128,24 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
+  config: () => request<AppConfig>("/api/v1/config"),
   lookup: (ic: string) =>
     request<LookupResult>("/api/v1/voters/lookup", { method: "POST", body: JSON.stringify({ ic }) }),
-  submit: (ic: string, answers: Answers) =>
-    request<SubmitResult>("/api/v1/responses", { method: "POST", body: JSON.stringify({ ic, answers }) }),
+  sprStart: (ic: string) =>
+    request<SprChallenge>("/api/v1/spr/lookups", { method: "POST", body: JSON.stringify({ ic }) }),
+  /** Either the voter's record (portal accepted the CAPTCHA) or a new challenge. */
+  sprAnswer: (jobId: string, answer: string) =>
+    request<LookupResult | SprChallenge>(`/api/v1/spr/lookups/${encodeURIComponent(jobId)}/captcha`, {
+      method: "POST",
+      body: JSON.stringify({ answer }),
+    }),
+  sprRefresh: (jobId: string) =>
+    request<SprChallenge>(`/api/v1/spr/lookups/${encodeURIComponent(jobId)}/refresh`, { method: "POST", body: "{}" }),
+  submit: (ic: string, answers: Answers, voterToken?: string) =>
+    request<SubmitResult>("/api/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ ic, answers, voter_token: voterToken }),
+    }),
   contests: (voter: Voter) => {
     const qs = new URLSearchParams({
       parlimen: voter.parlimen.code,
@@ -183,6 +217,42 @@ export type PhotoRow = {
 
 export type PhotoPage = { items: PhotoRow[]; counts: Partial<Record<PhotoStatus, number>>; page: number; limit: number; total: number };
 
+export type PhaseStatus = "pending" | "processing" | "completed" | "completed_with_warnings" | "failed";
+
+export type CandidatePhase = {
+  id: number;
+  status: PhaseStatus;
+  total: number;
+  remaining: number;
+  approved: number;
+  review: number;
+  not_found: number;
+  failed: number;
+  started_at: string;
+  finished_at: string | null;
+  ready: boolean;
+};
+
+export type SprLookupRow = {
+  id: string;
+  ic_masked: string;
+  operator: string;
+  status: string;
+  reason: string | null;
+  captcha_attempts: number;
+  created_at: string;
+  finished_at: string | null;
+};
+
+export type SprAdmin = {
+  voter_source: "demo" | "spr";
+  require_candidates: boolean;
+  phase: CandidatePhase | null;
+  worker: { open_sessions: number; requests: Record<string, number>; retries: Record<string, number>; failures: Record<string, number>; dedup_hits: number } | null;
+  lookups: SprLookupRow[];
+  counts_24h: Record<string, number>;
+};
+
 export function adminApi(key: string) {
   const headers = { "X-API-Key": key };
   return {
@@ -199,8 +269,9 @@ export function adminApi(key: string) {
         headers,
         body: JSON.stringify(path ? { path } : {}),
       }),
+    spr: () => request<SprAdmin>("/api/admin/spr", { headers }),
     photoScan: () =>
-      request<{ seats: number; seats_failed: number; candidates: number; queued: number }>("/api/admin/photos/scan", {
+      request<{ seats: number; seats_failed: number; candidates: number; queued: number; phase_status: PhaseStatus }>("/api/admin/photos/scan", {
         method: "POST",
         headers,
         body: "{}",

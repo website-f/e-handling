@@ -333,24 +333,55 @@ func (a *App) handlePhotoScan(w http.ResponseWriter, r *http.Request) {
 		all = append(all, cs...)
 	}
 
-	queued := 0
-	b := &pgx.Batch{}
 	seen := map[string]bool{}
 	for _, c := range all {
 		for _, e := range c.Ballot {
-			if e.Record == nil || seen[e.Record.UID] {
+			if e.Record != nil {
+				seen[e.Record.UID] = true
+			}
+		}
+	}
+
+	// Each scan is one "candidates" phase. Every candidate it covers (new or already known) is
+	// tagged with the phase; the phase completes once all of them reach a terminal photo state,
+	// and only then does the SPR voter lookup open (spr.go gateOpen).
+	status := "processing"
+	switch {
+	case len(seats) > 0 && failed == len(seats):
+		status = "failed"
+	case len(seen) == 0:
+		status = "completed"
+	}
+	detail, _ := json.Marshal(map[string]int{"seats": len(seats), "seats_failed": failed})
+	var phaseID int64
+	if err := a.db.QueryRow(ctx, `INSERT INTO pipeline_phases (name, status, total, detail, finished_at)
+		VALUES ('candidates', $1, $2, $3, CASE WHEN $1 = 'processing' THEN NULL ELSE now() END) RETURNING id`,
+		status, len(seen), detail).Scan(&phaseID); err != nil {
+		a.fail(w, "photo scan phase", err)
+		return
+	}
+
+	queued := 0
+	b := &pgx.Batch{}
+	done := map[string]bool{}
+	for _, c := range all {
+		for _, e := range c.Ballot {
+			if e.Record == nil || done[e.Record.UID] {
 				continue
 			}
-			seen[e.Record.UID] = true
-			b.Queue(`INSERT INTO candidate_photos (uid, name, party, seat, state) VALUES ($1, $2, $3, $4, $5)
-				ON CONFLICT (uid) DO NOTHING`, e.Record.UID, e.Name, e.Party, c.Seat, c.State)
+			done[e.Record.UID] = true
+			// xmax = 0 only for a freshly inserted row: existing ones keep their status and files.
+			b.Queue(`INSERT INTO candidate_photos (uid, name, party, seat, state, phase_id) VALUES ($1, $2, $3, $4, $5, $6)
+				ON CONFLICT (uid) DO UPDATE SET phase_id = EXCLUDED.phase_id RETURNING xmax = 0`,
+				e.Record.UID, e.Name, e.Party, c.Seat, c.State, phaseID)
 			a.photos.enqueued.Store(e.Record.UID, struct{}{})
 		}
 	}
 	if b.Len() > 0 {
 		br := a.db.SendBatch(ctx, b)
 		for i := 0; i < b.Len(); i++ {
-			if tag, err := br.Exec(); err == nil && tag.RowsAffected() == 1 {
+			var inserted bool
+			if err := br.QueryRow().Scan(&inserted); err == nil && inserted {
 				queued++
 			}
 		}
@@ -359,5 +390,9 @@ func (a *App) handlePhotoScan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"seats": len(seats), "seats_failed": failed, "candidates": len(seen), "queued": queued})
+	a.gate.mu.Lock()
+	a.gate.info = nil // a new phase closes the gate until it completes
+	a.gate.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"seats": len(seats), "seats_failed": failed, "candidates": len(seen),
+		"queued": queued, "phase_id": phaseID, "phase_status": status})
 }

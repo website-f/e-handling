@@ -16,10 +16,13 @@ export function IcStep({
   initialIc,
   error,
   onSubmit,
+  demo,
 }: {
   initialIc: string;
   error: string | null;
   onSubmit: (digits: string) => void;
+  /** Demo register: offer sample ICs. Off when lookups go to the real SPR portal. */
+  demo: boolean;
 }) {
   const [digits, setDigits] = React.useState(initialIc);
   const [localError, setLocalError] = React.useState<string | null>(null);
@@ -54,14 +57,18 @@ export function IcStep({
       <StepHeading
         autoFocus={false}
         title="Semak Daftar Pemilih"
-        lead="Masukkan nombor kad pengenalan anda untuk melihat tempat mengundi dan senarai calon di kawasan anda."
+        lead={
+          demo
+            ? "Masukkan nombor kad pengenalan anda untuk melihat tempat mengundi dan senarai calon di kawasan anda."
+            : "Masukkan nombor kad pengenalan anda. Semakan dibuat terus di portal MySPR Semak (SPR)."
+        }
       />
 
       <form onSubmit={handleSubmit} noValidate className="overflow-hidden rounded-2xl border bg-card shadow-lift">
         <div className="grid grid-cols-1 gap-2 p-5 sm:p-7">
           <Label htmlFor="ic">Nombor Kad Pengenalan (MyKad)</Label>
           <p id="ic-help" className="text-base text-muted-foreground">
-            12 digit nombor. Contoh: <span className="font-mono">990123-12-5571</span>
+            12 digit nombor{demo && <>. Contoh: <span className="font-mono">990123-12-5571</span></>}
           </p>
 
           <div className="relative mt-2 min-w-0">
@@ -119,7 +126,7 @@ export function IcStep({
         </p>
       </form>
 
-      <section aria-label="Nombor contoh" className="mt-6 rounded-2xl border border-dashed border-input/50 p-4 sm:p-5">
+      {demo && <section aria-label="Nombor contoh" className="mt-6 rounded-2xl border border-dashed border-input/50 p-4 sm:p-5">
         <p className="text-base font-bold">Mod demo</p>
         <p className="mt-0.5 text-sm text-muted-foreground">Tekan salah satu nombor contoh untuk mencuba.</p>
         <div className="mt-3 grid gap-2 sm:grid-cols-2">
@@ -135,7 +142,7 @@ export function IcStep({
             </button>
           ))}
         </div>
-      </section>
+      </section>}
     </>
   );
 }

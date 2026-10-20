@@ -83,6 +83,24 @@ Web finds are **auto-approved only on consensus**: the same face (OpenCV SFace, 
 
 Dry run for one candidate: `docker compose run --rm photos python worker.py --test "Name" PARTY "P.173 Putatan"`.
 
+Every download is checked before use: HTTP 200, an image `Content-Type`, a real JPEG/PNG/WebP file signature, the size limit and a complete body. Its SHA-256 is recorded, and a picture already used for another candidate is skipped (never one candidate's photo for another). Each finished candidate gets `meta/<uid>.json` in the photos volume (sources, checksums, retrieval time, status; not served publicly). If Bing answers with a CAPTCHA or block page the worker stops searching for that candidate and re-queues it after 30 minutes instead of retrying.
+
+## Real voter lookup (MySPR Semak)
+
+With `VOTER_SOURCE=spr` the IC is checked on the official portal, [mysprsemak.spr.gov.my](https://mysprsemak.spr.gov.my/semakan/daftarPemilih), instead of the demo register:
+
+1. The voter enters their IC. The API validates it, writes an audit row (masked IC + keyed hash, never the IC itself) and asks the `spr` service to open the portal form in a fresh, isolated Camoufox context and fill in that IC.
+2. The portal's own 4-digit CAPTCHA image is shown to the voter, who types it. **Nothing reads or solves the CAPTCHA**; there is no OCR. "Gambar lain" uses the portal's own refresh link.
+3. "Semak" is pressed exactly once per CAPTCHA. If the portal has since swapped its CAPTCHA (it does every 120 s), the voter gets the new image instead of a doomed submission. A wrong CAPTCHA gives a new image (3 tries). A timeout after submitting ends the session; it is never resubmitted blindly.
+4. Only the fields the portal shows (name, parliament, DUN, polling district, locality, state, and polling centre / stream / time when present) are read, and only if the page is complete and shows the same IC. Nothing missing is guessed. Date of birth and gender still come from the IC digits.
+5. The record becomes a `voters` row (`source='spr'`) and the voter receives a short-lived token the survey submission requires. Rows with no survey response are purged after 24 h (`SPR_VOTER_RETENTION`).
+
+Access-denied pages, bot checks and login walls stop the lookup with a message telling the voter to use the portal directly. Lookups are rate limited at the gateway (20/min per IP) and the service holds at most `SPR_MAX_CONCURRENT_PAGES` (3) portal sessions at once.
+
+**Gate:** lookups only open once the latest candidates phase is complete. A phase starts with admin > Foto Calon > "Cari foto semua calon" and completes when every scanned candidate's photo search has finished (`completed`, or `completed_with_warnings` if some have no photo). Admin > Semakan SPR shows the gate, worker counters and the masked audit log. Every setting is in [docs/automation-config.md](docs/automation-config.md).
+
+Turn it on: set `VOTER_SOURCE=spr` (the VPS deploy script generates `SPR_INTERNAL_TOKEN`), deploy, then run the photo scan once.
+
 ## Flow
 
 1. **Semak**: IC entry with numeric keypad, auto dashes, digit counter, inline errors.
@@ -132,5 +150,12 @@ Seed data lives in [api/sql/seed.sql](api/sql/seed.sql) and is applied on every 
 
 ```bash
 cd api && go test ./...
+# + the end-to-end SPR flow against a throwaway Postgres (gate, audit, token, retention):
+docker run -d --rm --name eh-test-db -e POSTGRES_PASSWORD=t -p 127.0.0.1:8809:5432 postgres:17-alpine
+TEST_DATABASE_URL=postgres://postgres:t@127.0.0.1:8809/postgres go test ./...
+
+cd photos && pip install pytest aiohttp httpx && python -m pytest tests   # interaction layer, SPR session logic, image checks
 cd frontend && npm run build   # type-check + build
 ```
+
+Python tests use a fake portal and synthetic IC numbers; nothing runs against the live SPR site.

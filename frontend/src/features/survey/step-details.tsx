@@ -15,12 +15,13 @@ function Field({ label, value, mono, className }: { label: string; value: string
   );
 }
 
-/** "173 / 23 / 01 / 001 - KG PETAGAS": code quieter, place name strong. */
+/** "173 / 23 / 01 / 001 - KG PETAGAS": code quieter, place name strong. Missing parts are left out, never filled in. */
 function AreaValue({ area }: { area: Area }) {
+  if (!area.code && !area.name) return <span className="text-muted-foreground">Tiada</span>;
   return (
     <>
-      <span className="text-muted-foreground tabular-nums">{area.code.split("/").join(" / ")}</span>
-      <span className="text-muted-foreground"> - </span>
+      {area.code && <span className="text-muted-foreground tabular-nums">{area.code.split("/").join(" / ")}</span>}
+      {area.code && area.name && <span className="text-muted-foreground"> - </span>}
       <span className="font-bold">{area.name}</span>
     </>
   );
@@ -28,6 +29,18 @@ function AreaValue({ area }: { area: Area }) {
 
 export function DetailsStep({ voter, onNext, onBack }: { voter: Voter; onNext: () => void; onBack: () => void }) {
   const levels: { label: string; value: ReactNode }[] = [
+    ...(voter.polling_centre
+      ? [{
+          label: "Pusat Mengundi",
+          value: (
+            <>
+              <span className="font-bold">{voter.polling_centre}</span>
+              {voter.stream && <span className="text-muted-foreground"> (Saluran {voter.stream})</span>}
+              {voter.voting_time && <span className="block text-base text-muted-foreground">{voter.voting_time}</span>}
+            </>
+          ),
+        }]
+      : []),
     { label: "Lokaliti", value: <AreaValue area={voter.lokaliti} /> },
     { label: "Daerah Mengundi", value: <AreaValue area={voter.daerah_mengundi} /> },
     { label: "DUN", value: <AreaValue area={voter.dun} /> },
@@ -50,7 +63,7 @@ export function DetailsStep({ voter, onNext, onBack }: { voter: Voter; onNext: (
             </h2>
             <span className="inline-flex items-center gap-1.5 rounded-full bg-card px-3 py-1 text-sm font-bold text-primary">
               <SealCheck size={18} weight="fill" />
-              Berdaftar
+              {voter.source === "spr" ? "Disahkan SPR" : "Berdaftar"}
             </span>
           </div>
           <dl className="grid gap-2.5 p-4 sm:grid-cols-3 sm:p-5">

@@ -46,6 +46,13 @@ services:
       DEMO_FALLBACK: ${DEMO_FALLBACK:-true}
       DB_MAX_CONNS: ${DB_MAX_CONNS:-40}
       ELECTIONDATA_API_KEY: ${ELECTIONDATA_API_KEY:-}
+      # demo = fictional register; spr = confirm each voter on MySPR Semak through the `spr` service.
+      VOTER_SOURCE: ${VOTER_SOURCE:-demo}
+      SPR_WORKER_URL: http://spr:8090
+      SPR_INTERNAL_TOKEN: ${SPR_INTERNAL_TOKEN:-}
+      SPR_REQUIRE_CANDIDATE_PHASE: ${SPR_REQUIRE_CANDIDATE_PHASE:-true}
+      SPR_VOTER_RETENTION: ${SPR_VOTER_RETENTION:-24h}
+      SPR_AUDIT_RETENTION: ${SPR_AUDIT_RETENTION:-2160h}
     depends_on:
       db: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -62,12 +69,29 @@ services:
       PHOTO_DIR: /data/photos
       PHOTO_AUTO_APPROVE: ${PHOTO_AUTO_APPROVE:-consensus}
       PHOTO_PACE_SECONDS: ${PHOTO_PACE_SECONDS:-6}
+      IMAGES_MAX_FILE_SIZE_MB: ${IMAGES_MAX_FILE_SIZE_MB:-15}
     volumes:
       - photos:/data/photos
     shm_size: 1gb
     mem_limit: 1500m
     depends_on:
       api: { condition: service_healthy }  # the API owns the schema
+    restart: unless-stopped
+
+  # MySPR Semak lookups (VOTER_SOURCE=spr). Same image as `photos`. One isolated Camoufox context
+  # per voter; the voter types the portal's own CAPTCHA (never read or solved here). Reachable only
+  # by the API on the compose network, with X-Internal-Token.
+  spr:
+    build: ./photos
+    command: ["python", "spr.py"]
+    environment:
+      SPR_INTERNAL_TOKEN: ${SPR_INTERNAL_TOKEN:-}
+      SPR_MAX_CONCURRENT_PAGES: ${SPR_MAX_CONCURRENT_PAGES:-3}
+      SPR_SESSION_TTL_S: ${SPR_SESSION_TTL_S:-240}
+      SPR_MAX_CAPTCHA_ATTEMPTS: ${SPR_MAX_CAPTCHA_ATTEMPTS:-3}
+      BROWSER_HEADLESS: ${BROWSER_HEADLESS:-true}
+    shm_size: 1gb
+    mem_limit: 1500m
     restart: unless-stopped
 
   gateway:

@@ -11,7 +11,11 @@ func (a *App) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", a.handleHealth)
 
+	mux.HandleFunc("GET /api/v1/config", a.handleConfig)
 	mux.HandleFunc("POST /api/v1/voters/lookup", a.handleLookup)
+	mux.HandleFunc("POST /api/v1/spr/lookups", a.handleSprStart)
+	mux.HandleFunc("POST /api/v1/spr/lookups/{id}/captcha", a.handleSprAnswer)
+	mux.HandleFunc("POST /api/v1/spr/lookups/{id}/refresh", a.handleSprRefresh)
 	mux.HandleFunc("POST /api/v1/responses", a.handleSubmit)
 	mux.HandleFunc("GET /api/v1/contests", a.handleContests)
 	mux.HandleFunc("GET /api/v1/candidates/{uid}", a.handleCandidateHistory)
@@ -23,6 +27,7 @@ func (a *App) routes() http.Handler {
 	mux.Handle("GET /api/admin/photos", a.requireAdmin(a.handleListPhotos))
 	mux.Handle("POST /api/admin/photos/scan", a.requireAdmin(a.handlePhotoScan))
 	mux.Handle("POST /api/admin/photos/{uid}/{action}", a.requireAdmin(a.handlePhotoAction))
+	mux.Handle("GET /api/admin/spr", a.requireAdmin(a.handleAdminSpr))
 	return a.observe(mux)
 }
 
@@ -68,6 +73,12 @@ type lookupResponse struct {
 	ContestsError    string            `json:"contests_error"` // set when candidates could not be loaded
 	Questions        []Question        `json:"questions"`
 	PreviousResponse *PreviousResponse `json:"previous_response"`
+	VoterToken       string            `json:"voter_token,omitempty"` // SPR mode: required to submit the survey
+}
+
+// GET /api/v1/config: which IC flow the frontend shows.
+func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"voter_source": a.cfg.VoterSource, "demo": a.cfg.VoterSource == "demo"})
 }
 
 // POST (not GET) so the IC number never lands in access logs or browser history.
@@ -76,6 +87,11 @@ func (a *App) handleLookup(w http.ResponseWriter, r *http.Request) {
 		IC string `json:"ic"`
 	}
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if a.cfg.VoterSource == "spr" {
+		// Every lookup goes through the portal (and its CAPTCHA); knowing an IC is not enough.
+		writeError(w, http.StatusForbidden, "verification_required", "Sila buat semakan melalui portal SPR.")
 		return
 	}
 	ic, info, ok := validateIC(w, req.IC)
@@ -109,8 +125,9 @@ func (a *App) handleLookup(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IC      string            `json:"ic"`
-		Answers map[string]string `json:"answers"`
+		IC         string            `json:"ic"`
+		Answers    map[string]string `json:"answers"`
+		VoterToken string            `json:"voter_token"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -120,6 +137,10 @@ func (a *App) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	if a.cfg.VoterSource == "spr" && !a.checkVoterToken(req.VoterToken, ic, time.Now()) {
+		writeError(w, http.StatusForbidden, "verification_required", "Sesi semakan telah tamat. Sila semak semula melalui portal SPR.")
+		return
+	}
 
 	voter, err := a.getVoter(ctx, ic, info)
 	if errors.Is(err, errNotFound) {
@@ -128,6 +149,10 @@ func (a *App) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		a.fail(w, "submit voter", err)
+		return
+	}
+	if a.cfg.VoterSource == "spr" && voter.Source != "spr" {
+		writeError(w, http.StatusForbidden, "verification_required", "Sila semak semula melalui portal SPR.")
 		return
 	}
 	qs, err := a.getQuestions(ctx)

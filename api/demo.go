@@ -28,8 +28,8 @@ func (a *App) createDemoVoter(ctx context.Context, ic string, info ICInfo) (Vote
 	name := names[int(sum%uint32(len(names)))]
 	locality := a.localities[int((sum>>8)%uint32(len(a.localities)))]
 
-	_, err := a.db.Exec(ctx, `INSERT INTO voters (ic, full_name, dob, gender, locality_code, is_demo)
-		VALUES ($1, $2, $3, $4, $5, true) ON CONFLICT (ic) DO NOTHING`,
+	_, err := a.db.Exec(ctx, `INSERT INTO voters (ic, full_name, dob, gender, locality_code, is_demo, source)
+		VALUES ($1, $2, $3, $4, $5, true, 'demo') ON CONFLICT (ic) DO NOTHING`,
 		ic, name, info.DOB, info.Gender, locality)
 	if err != nil {
 		return Voter{}, err

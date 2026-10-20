@@ -1,7 +1,7 @@
 import * as React from "react";
 import {
   ArrowClockwise, ArrowsClockwise, CalendarCheck, CaretDown, CaretLeft, CaretRight, ChartBar, Code, DownloadSimple,
-  Image as ImageIcon, Key, ListBullets, MagnifyingGlass, SignOut, UserPlus, Users, WarningCircle,
+  IdentificationBadge, Image as ImageIcon, Key, ListBullets, MagnifyingGlass, SignOut, UserPlus, Users, WarningCircle,
 } from "@phosphor-icons/react";
 import { AppShell } from "@/components/app-shell";
 import { Alert } from "@/components/ui/alert";
@@ -14,6 +14,7 @@ import { adminApi, ApiError, type CountRow, type ResponsePage, type ResponseRow,
 import { formatArea, formatDateMs, formatDateTimeMs, formatIC } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { PhotosPanel } from "./photos-panel";
+import { SprPanel } from "./spr-panel";
 
 const KEY_STORAGE = "eh-admin-key";
 type Prompts = Record<string, Stats["questions"][number]>;
@@ -181,6 +182,10 @@ function Dashboard({ apiKey, onSignOut }: { apiKey: string; onSignOut: () => voi
             <ImageIcon size={20} weight="bold" />
             Foto Calon
           </TabsTrigger>
+          <TabsTrigger value="spr">
+            <IdentificationBadge size={20} weight="bold" />
+            Semakan SPR
+          </TabsTrigger>
           <TabsTrigger value="api">
             <Code size={20} weight="bold" />
             API
@@ -234,6 +239,10 @@ function Dashboard({ apiKey, onSignOut }: { apiKey: string; onSignOut: () => voi
 
         <TabsContent value="photos">
           <PhotosPanel client={client} />
+        </TabsContent>
+
+        <TabsContent value="spr">
+          <SprPanel client={client} />
         </TabsContent>
 
         <TabsContent value="api">

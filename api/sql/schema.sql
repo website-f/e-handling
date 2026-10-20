@@ -71,3 +71,47 @@ CREATE TABLE IF NOT EXISTS candidate_photos (
   updated_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS candidate_photos_queue_idx ON candidate_photos (status, queued_at);
+
+-- Where a voter row came from: 'seed' (demo data), 'demo' (DEMO_FALLBACK) or 'spr' (confirmed
+-- on MySPR Semak by the voter themselves). SPR rows without a survey response are purged after
+-- SPR_VOTER_RETENTION (spr_retention.go).
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'seed';
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS verified_at timestamptz;
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS polling_centre text NOT NULL DEFAULT '';
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS stream text NOT NULL DEFAULT '';
+ALTER TABLE voters ADD COLUMN IF NOT EXISTS voting_time text NOT NULL DEFAULT '';
+UPDATE voters SET source = 'demo' WHERE is_demo AND source = 'seed';
+CREATE INDEX IF NOT EXISTS voters_spr_idx ON voters (verified_at) WHERE source = 'spr';
+
+-- Audit trail for MySPR lookups. Never the IC itself: a keyed hash (to bind a job to its IC) and
+-- a masked form an operator can read. Purged after SPR_AUDIT_RETENTION.
+CREATE TABLE IF NOT EXISTS spr_lookups (
+  id               uuid PRIMARY KEY,
+  ic_hash          text NOT NULL,
+  ic_masked        text NOT NULL,
+  operator         text NOT NULL DEFAULT 'voter',   -- self-service: the voter looks up their own IC
+  ip_hash          text,
+  status           text NOT NULL,
+  reason           text,
+  captcha_attempts integer NOT NULL DEFAULT 0,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  finished_at      timestamptz
+);
+CREATE INDEX IF NOT EXISTS spr_lookups_created_idx ON spr_lookups (created_at DESC);
+
+-- Workflow phases. 'candidates' = one admin "scan" of every seat's candidates and their photos.
+-- The SPR lookup stays closed until the latest candidates phase reaches a completed state.
+CREATE TABLE IF NOT EXISTS pipeline_phases (
+  id          bigserial PRIMARY KEY,
+  name        text NOT NULL,
+  status      text NOT NULL
+              CHECK (status IN ('pending', 'processing', 'completed', 'completed_with_warnings', 'failed')),
+  total       integer NOT NULL DEFAULT 0,
+  detail      jsonb NOT NULL DEFAULT '{}',
+  started_at  timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS pipeline_phases_name_idx ON pipeline_phases (name, id DESC);
+ALTER TABLE candidate_photos ADD COLUMN IF NOT EXISTS phase_id bigint;
+CREATE INDEX IF NOT EXISTS candidate_photos_phase_idx ON candidate_photos (phase_id, status);

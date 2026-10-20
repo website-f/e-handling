@@ -2,3 +2,5 @@
 node_modules/
 frontend/dist/
 *.exe
+__pycache__/
+.pytest_cache/

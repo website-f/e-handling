@@ -64,7 +64,10 @@ export function PhotosPanel({ client }: { client: Client }) {
     setNotice(null);
     try {
       const r = await client.photoScan();
-      setNotice(`${r.candidates} calon dari ${r.seats} kawasan diperiksa, ${r.queued} baharu dimasukkan ke barisan carian.`);
+      setNotice(
+        `${r.candidates} calon dari ${r.seats} kawasan diperiksa, ${r.queued} baharu dimasukkan ke barisan carian.` +
+          (r.phase_status === "processing" ? " Semakan SPR dibuka sebaik sahaja semua calon selesai diproses." : ""),
+      );
       load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Imbasan gagal.");

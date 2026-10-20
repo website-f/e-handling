@@ -1,10 +1,11 @@
 import * as React from "react";
 import { AnimatePresence, m, useReducedMotion } from "motion/react";
 import { AppShell } from "@/components/app-shell";
-import { api, ApiError, type Answers, type LookupResult, type SubmitResult } from "@/lib/api";
+import { api, ApiError, type Answers, type AppConfig, type LookupResult, type SprChallenge, type SubmitResult } from "@/lib/api";
 import { sleep } from "@/lib/utils";
 import { MobileProgress, StepRail } from "./shared";
 import { IcStep } from "./step-ic";
+import { CaptchaStep } from "./step-captcha";
 import { LoadingStep, LOADING_MIN_MS } from "./step-loading";
 import { DetailsStep } from "./step-details";
 import { CandidatesStep } from "./step-candidates";
@@ -14,13 +15,14 @@ import { DoneStep } from "./step-done";
 type Phase =
   | { name: "ic" }
   | { name: "loading" }
+  | { name: "captcha" }
   | { name: "details" }
   | { name: "candidates" }
   | { name: "question"; index: number }
   | { name: "done" };
 
 const STAGE_OF: Record<Phase["name"], number> = {
-  ic: 0, loading: 0, details: 1, candidates: 2, question: 3, done: 4,
+  ic: 0, loading: 0, captcha: 0, details: 1, candidates: 2, question: 3, done: 4,
 };
 
 export function SurveyFlow() {
@@ -31,6 +33,14 @@ export function SurveyFlow() {
   const [data, setData] = React.useState<LookupResult | null>(null);
   const [answers, setAnswers] = React.useState<Answers>({});
   const [result, setResult] = React.useState<SubmitResult | null>(null);
+  const [config, setConfig] = React.useState<AppConfig | null>(null);
+  const [challenge, setChallenge] = React.useState<SprChallenge | null>(null);
+  const [captchaBusy, setCaptchaBusy] = React.useState(false);
+  const [captchaError, setCaptchaError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    api.config().then(setConfig, () => setConfig({ voter_source: "demo", demo: true }));
+  }, []);
 
   // Forward moves push a history entry so the phone's Back button walks back one screen
   // instead of leaving the site.
@@ -44,6 +54,7 @@ export function SurveyFlow() {
     const onPop = () =>
       setPhase((p) => {
         switch (p.name) {
+          case "captcha": return { name: "ic" };
           case "details": return { name: "ic" };
           case "candidates": return { name: "details" };
           case "question": return p.index === 0 ? { name: "candidates" } : { name: "question", index: p.index - 1 };
@@ -59,7 +70,71 @@ export function SurveyFlow() {
     window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
   }, [phase]);
 
+  function showRecord(res: LookupResult) {
+    setData(res);
+    setAnswers(res.previous_response?.answers ?? {});
+    setResult(null);
+    setChallenge(null);
+    forward({ name: "details" });
+  }
+
+  function failToIc(err: unknown) {
+    setIcError(err instanceof ApiError ? err.message : "Ralat tidak dijangka. Sila cuba lagi.");
+    setChallenge(null);
+    setPhase({ name: "ic" });
+  }
+
+  // SPR mode: open the portal for this IC, then show the voter the portal's CAPTCHA.
+  async function sprStart(digits: string) {
+    setIc(digits);
+    setIcError(null);
+    setCaptchaError(null);
+    setPhase({ name: "loading" });
+    try {
+      const ch = await api.sprStart(digits);
+      setChallenge(ch);
+      forward({ name: "captcha" });
+    } catch (err) {
+      failToIc(err);
+    }
+  }
+
+  async function sprAnswer(answer: string) {
+    if (!challenge || captchaBusy) return;
+    setCaptchaBusy(true);
+    setCaptchaError(null);
+    try {
+      const res = await api.sprAnswer(challenge.job_id, answer);
+      if ("voter" in res) showRecord(res);
+      else setChallenge(res);
+    } catch (err) {
+      // Terminal outcomes (not registered, expired, portal changed...) end this attempt.
+      if (err instanceof ApiError && (err.code === "invalid_answer" || err.code === "in_progress")) {
+        setCaptchaError(err.message);
+      } else {
+        failToIc(err);
+      }
+    } finally {
+      setCaptchaBusy(false);
+    }
+  }
+
+  async function sprRefresh() {
+    if (!challenge || captchaBusy) return;
+    setCaptchaBusy(true);
+    setCaptchaError(null);
+    try {
+      setChallenge(await api.sprRefresh(challenge.job_id));
+    } catch (err) {
+      failToIc(err);
+    } finally {
+      setCaptchaBusy(false);
+    }
+  }
+
   async function lookup(digits: string) {
+    const cfg = config ?? (await api.config().catch(() => null));
+    if (cfg?.voter_source === "spr") return sprStart(digits);
     setIc(digits);
     setIcError(null);
     setPhase({ name: "loading" });
@@ -81,13 +156,27 @@ export function SurveyFlow() {
     setResult(null);
     setIc("");
     setIcError(null);
+    setChallenge(null);
     setPhase({ name: "ic" });
   }
 
   let screen: React.ReactNode;
   switch (phase.name) {
     case "ic":
-      screen = <IcStep initialIc={ic} error={icError} onSubmit={lookup} />;
+      screen = <IcStep initialIc={ic} error={icError} onSubmit={lookup} demo={config?.demo ?? false} />;
+      break;
+    case "captcha":
+      screen = (
+        <CaptchaStep
+          ic={ic}
+          challenge={challenge!}
+          busy={captchaBusy}
+          error={captchaError}
+          onSubmit={sprAnswer}
+          onRefresh={sprRefresh}
+          onBack={back}
+        />
+      );
       break;
     case "loading":
       screen = <LoadingStep />;
@@ -124,7 +213,7 @@ export function SurveyFlow() {
           onBack={back}
           onNext={async () => {
             if (!isLast) return forward({ name: "question", index: phase.index + 1 });
-            const res = await api.submit(ic, answers);
+            const res = await api.submit(ic, answers, data!.voter_token);
             setResult(res);
             forward({ name: "done" });
           }}
